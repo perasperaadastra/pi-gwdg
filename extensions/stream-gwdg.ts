@@ -29,6 +29,16 @@ function debug(...args: unknown[]): void {
 }
 
 /**
+ * Removes unpaired Unicode surrogate characters from a string.
+ * Unpaired surrogates cause JSON serialization errors in many API providers.
+ */
+function sanitizeSurrogates(text: string): string {
+	// Replace unpaired high surrogates (0xD800-0xDBFF not followed by low surrogate)
+	// Replace unpaired low surrogates (0xDC00-0xDFFF not preceded by high surrogate)
+	return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
+}
+
+/**
  * SSE Parsing - Parse Server-Sent Events from response body
  */
 async function* parseSSE(response: Response): AsyncGenerator<Record<string, unknown>> {
@@ -216,7 +226,7 @@ function buildRequestBody(
 	if (context.systemPrompt) {
 		messages.push({
 			role: "system",
-			content: context.systemPrompt,
+			content: sanitizeSurrogates(context.systemPrompt),
 		});
 	}
 
@@ -224,11 +234,11 @@ function buildRequestBody(
 	for (const msg of context.messages) {
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
-				messages.push({ role: "user", content: msg.content });
+				messages.push({ role: "user", content: sanitizeSurrogates(msg.content) });
 			} else {
 				const content = msg.content.map((item) => {
 					if (item.type === "text") {
-						return { type: "text", text: item.text };
+						return { type: "text", text: sanitizeSurrogates(item.text) };
 					} else {
 						return {
 							type: "image_url",
@@ -246,7 +256,7 @@ function buildRequestBody(
 			const toolCalls = content.filter((c) => c.type === "toolCall");
 
 			if (textContent.length > 0) {
-				assistantMsg.content = textContent.map((c) => (c as TextContent).text).join("");
+				assistantMsg.content = textContent.map((c) => sanitizeSurrogates((c as TextContent).text)).join("");
 			}
 
 			if (toolCalls.length > 0) {
@@ -265,10 +275,11 @@ function buildRequestBody(
 			messages.push({
 				role: "tool",
 				tool_call_id: msg.toolCallId,
-				content:
+				content: sanitizeSurrogates(
 					msg.content
 						?.map((c) => (c.type === "text" ? c.text : `[${c.type}]`))
 						.join("\n") || "",
+				),
 			});
 		}
 	}
