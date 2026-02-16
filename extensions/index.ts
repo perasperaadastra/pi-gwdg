@@ -22,8 +22,8 @@ import { join } from "path";
 
 // Cache configuration
 const CACHE_FILE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days on disk
-const CACHE_DIR = getAgentDir();
-const CACHE_FILE = join(CACHE_DIR, "gwdg-models-cache.json");
+const CACHE_DIR = join(getAgentDir(), "cache", "pi-gwdg");
+const CACHE_FILE = join(CACHE_DIR, "models-cache.json");
 
 const GWDG_DEBUG = process.env.GWDG_DEBUG === "1";
 const GWDG_ASYNC_INIT = process.env.GWDG_ASYNC_INIT === "true";
