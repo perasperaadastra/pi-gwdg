@@ -29,6 +29,8 @@ function debug(...args: unknown[]): void {
 	}
 }
 
+const rateLimitResetTimes = new Map<string, { resetTimestamp: number }>();
+
 /**
  * Removes unpaired Unicode surrogate characters from a string.
  * Unpaired surrogates cause JSON serialization errors in many API providers.
@@ -463,6 +465,24 @@ export function createStreamSimpleGwdg(
 				debug("streamSimpleGwdg: model:", model.id, "baseUrl:", model.baseUrl);
 				debug("streamSimpleGwdg: piEventEmitter:", piEventEmitter ? "defined" : "undefined");
 
+				// Check if we have a stored rate limit reset time
+				const cachedReset = rateLimitResetTimes.get(model.baseUrl);
+				if (cachedReset) {
+					const nowSeconds = Math.floor(Date.now() / 1000);
+					if (cachedReset.resetTimestamp > nowSeconds) {
+						const waitSeconds = cachedReset.resetTimestamp - nowSeconds;
+						const resetTimeStr = new Date(cachedReset.resetTimestamp * 1000).toLocaleTimeString(
+							undefined,
+							{ hour: "2-digit", minute: "2-digit", second: "2-digit" },
+						);
+						output.errorMessage = `Waiting for rate limit reset (~${waitSeconds}s, until ${resetTimeStr})`;
+						stream.push({ type: "status", content: output.errorMessage, partial: output });
+						debug("Waiting for rate limit reset:", waitSeconds, "seconds");
+						await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+						rateLimitResetTimes.delete(model.baseUrl);
+					}
+				}
+
 				// Build headers
 				const headers: Record<string, string> = {
 					"Content-Type": "application/json",
@@ -503,8 +523,29 @@ export function createStreamSimpleGwdg(
 
 					// Check if rate limited
 					if (response.status === 429) {
+						const resetHeader =
+							response.headers.get("ratelimit-reset") ||
+							response.headers.get("x-ratelimit-reset");
+						const resetSeconds = resetHeader ? parseInt(resetHeader, 10) : undefined;
+
+						let rateLimitInfo = "";
+						if (resetSeconds && !isNaN(resetSeconds)) {
+							const resetTimestamp = Math.floor(Date.now() / 1000) + resetSeconds;
+
+							// Store for next request
+							rateLimitResetTimes.set(model.baseUrl, { resetTimestamp });
+
+							const resetDate = new Date(resetTimestamp * 1000);
+							const resetTimeStr = resetDate.toLocaleTimeString(undefined, {
+								hour: "2-digit",
+								minute: "2-digit",
+								second: "2-digit",
+							});
+							rateLimitInfo = `\n(waiting until ${resetTimeStr}, ~${resetSeconds}s)`;
+						}
+
 						output.stopReason = "error";
-						output.errorMessage = `Rate limited (429): ${errorText}`;
+						output.errorMessage = `Rate limited (429): ${errorText}${rateLimitInfo}`;
 						stream.push({ type: "error", reason: "error", error: output });
 						stream.end();
 						return;
