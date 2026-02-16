@@ -710,8 +710,17 @@ export function createStreamSimpleGwdg(
 				stream.end();
 			} catch (error) {
 				debug("Stream error:", error);
+
+				// Clean up block indices (pi-mono feature)
+				for (const block of output.content) delete (block as any).index;
+
 				output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-				output.errorMessage = error instanceof Error ? error.message : String(error);
+				output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
+
+				// Extract additional metadata from provider errors (OpenRouter, etc.)
+				const rawMetadata = (error as any)?.error?.metadata?.raw;
+				if (rawMetadata) output.errorMessage += `\n${rawMetadata}`;
+
 				stream.push({ type: "error", reason: output.stopReason, error: output });
 				stream.end();
 			}
