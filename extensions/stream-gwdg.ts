@@ -615,28 +615,49 @@ export function createStreamSimpleGwdg(
 						}
 					}
 
-					// Handle reasoning (thinking)
-					if (delta.reasoning !== undefined && delta.reasoning !== "") {
-						if (!currentBlock || currentBlock.type !== "thinking") {
-							finishCurrentBlock(currentBlock);
-							currentBlock = {
-								type: "thinking",
-								thinking: "",
-							};
-							output.content.push(currentBlock);
-							stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
-						}
-
-						if (currentBlock.type === "thinking") {
-							currentBlock.thinking += delta.reasoning;
-							stream.push({
-								type: "thinking_delta",
-								contentIndex: blockIndex(),
-								delta: delta.reasoning,
-								partial: output,
-							});
+				// Handle reasoning (thinking)
+				// Some endpoints return reasoning in reasoning_content (llama.cpp),
+				// or reasoning (other openai compatible endpoints)
+				// Use the first non-empty reasoning field to avoid duplication
+				// (some return both reasoning_content and reasoning with same content)
+				const reasoningFields = ["reasoning_content", "reasoning", "reasoning_text"];
+				let foundReasoningField: string | null = null;
+				for (const field of reasoningFields) {
+					if (
+						(delta as any)[field] !== null &&
+						(delta as any)[field] !== undefined &&
+						(delta as any)[field].length > 0
+					) {
+						if (!foundReasoningField) {
+							foundReasoningField = field;
+							break;
 						}
 					}
+				}
+
+				if (foundReasoningField) {
+					if (!currentBlock || currentBlock.type !== "thinking") {
+						finishCurrentBlock(currentBlock);
+						currentBlock = {
+							type: "thinking",
+							thinking: "",
+							thinkingSignature: foundReasoningField,
+						};
+						output.content.push(currentBlock);
+						stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
+					}
+
+					if (currentBlock.type === "thinking") {
+						const reasoningDelta = (delta as any)[foundReasoningField];
+						currentBlock.thinking += reasoningDelta;
+						stream.push({
+							type: "thinking_delta",
+							contentIndex: blockIndex(),
+							delta: reasoningDelta,
+							partial: output,
+						});
+					}
+				}
 
 					// Handle tool calls
 					if (delta.tool_calls && delta.tool_calls.length > 0) {
