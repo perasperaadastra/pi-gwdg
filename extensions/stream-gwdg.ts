@@ -11,6 +11,7 @@ import type {
 	AssistantMessageEventStream,
 	Context,
 	Model,
+	OpenAICompletionsCompat,
 	SimpleStreamOptions,
 	StopReason,
 	TextContent,
@@ -36,6 +37,58 @@ function sanitizeSurrogates(text: string): string {
 	// Replace unpaired high surrogates (0xD800-0xDBFF not followed by low surrogate)
 	// Replace unpaired low surrogates (0xDC00-0xDFFF not preceded by high surrogate)
 	return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "");
+}
+
+/**
+ * Extended stream options for GWDG with toolChoice support
+ */
+export interface GwdgStreamOptions extends SimpleStreamOptions {
+	toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
+}
+
+/**
+ * GWDG compatibility defaults.
+ * GWDG is OpenAI-compatible, so most features work out of the box.
+ */
+const GWDG_DEFAULT_COMPAT: Required<OpenAICompletionsCompat> = {
+	supportsStore: true,
+	supportsDeveloperRole: true,
+	supportsReasoningEffort: false,
+	supportsUsageInStreaming: true,
+	maxTokensField: "max_completion_tokens",
+	requiresToolResultName: false,
+	requiresAssistantAfterToolResult: false,
+	requiresThinkingAsText: false,
+	requiresMistralToolIds: false,
+	thinkingFormat: "openai",
+	openRouterRouting: {},
+	vercelGatewayRouting: {},
+	supportsStrictMode: true,
+};
+
+/**
+ * Get compatibility settings for GWDG.
+ * Uses model.compat if provided, otherwise GWDG defaults.
+ */
+function getGwdgCompat(model: Model<"openai-completions">): Required<OpenAICompletionsCompat> {
+	if (!model.compat) return GWDG_DEFAULT_COMPAT;
+
+	return {
+		supportsStore: model.compat.supportsStore ?? GWDG_DEFAULT_COMPAT.supportsStore,
+		supportsDeveloperRole: model.compat.supportsDeveloperRole ?? GWDG_DEFAULT_COMPAT.supportsDeveloperRole,
+		supportsReasoningEffort: model.compat.supportsReasoningEffort ?? GWDG_DEFAULT_COMPAT.supportsReasoningEffort,
+		supportsUsageInStreaming: model.compat.supportsUsageInStreaming ?? GWDG_DEFAULT_COMPAT.supportsUsageInStreaming,
+		maxTokensField: model.compat.maxTokensField ?? GWDG_DEFAULT_COMPAT.maxTokensField,
+		requiresToolResultName: model.compat.requiresToolResultName ?? GWDG_DEFAULT_COMPAT.requiresToolResultName,
+		requiresAssistantAfterToolResult:
+			model.compat.requiresAssistantAfterToolResult ?? GWDG_DEFAULT_COMPAT.requiresAssistantAfterToolResult,
+		requiresThinkingAsText: model.compat.requiresThinkingAsText ?? GWDG_DEFAULT_COMPAT.requiresThinkingAsText,
+		requiresMistralToolIds: model.compat.requiresMistralToolIds ?? GWDG_DEFAULT_COMPAT.requiresMistralToolIds,
+		thinkingFormat: model.compat.thinkingFormat ?? GWDG_DEFAULT_COMPAT.thinkingFormat,
+		openRouterRouting: model.compat.openRouterRouting ?? GWDG_DEFAULT_COMPAT.openRouterRouting,
+		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? GWDG_DEFAULT_COMPAT.vercelGatewayRouting,
+		supportsStrictMode: model.compat.supportsStrictMode ?? GWDG_DEFAULT_COMPAT.supportsStrictMode,
+	};
 }
 
 /**
@@ -213,19 +266,20 @@ function emitRateLimits(
 }
 
 /**
- * Build the request body for OpenAI-compatible chat completions
+ * Build messages array for the request
  */
-function buildRequestBody(
+function buildMessages(
 	model: Model<"openai-completions">,
 	context: Context,
-	options?: SimpleStreamOptions,
-): Record<string, unknown> {
+	compat: Required<OpenAICompletionsCompat>,
+): Record<string, unknown>[] {
 	const messages: Record<string, unknown>[] = [];
 
 	// Add system prompt
 	if (context.systemPrompt) {
+		const role = compat.supportsDeveloperRole && model.reasoning ? "developer" : "system";
 		messages.push({
-			role: "system",
+			role,
 			content: sanitizeSurrogates(context.systemPrompt),
 		});
 	}
@@ -272,7 +326,7 @@ function buildRequestBody(
 
 			messages.push(assistantMsg);
 		} else if (msg.role === "toolResult") {
-			messages.push({
+			const toolResultMsg: Record<string, unknown> = {
 				role: "tool",
 				tool_call_id: msg.toolCallId,
 				content: sanitizeSurrogates(
@@ -280,24 +334,62 @@ function buildRequestBody(
 						?.map((c) => (c.type === "text" ? c.text : `[${c.type}]`))
 						.join("\n") || "",
 				),
-			});
+			};
+
+			if (compat.requiresToolResultName && msg.toolName) {
+				toolResultMsg.name = msg.toolName;
+			}
+
+			messages.push(toolResultMsg);
 		}
 	}
 
-	// Build request params
+	return messages;
+}
+
+/**
+ * Build the request body for OpenAI-compatible chat completions
+ */
+function buildRequestBody(
+	model: Model<"openai-completions">,
+	context: Context,
+	options?: GwdgStreamOptions,
+): Record<string, unknown> {
+	const compat = getGwdgCompat(model);
+	const messages = buildMessages(model, context, compat);
+
 	const params: Record<string, unknown> = {
 		model: model.id,
 		messages,
 		stream: true,
-		stream_options: { include_usage: true },
 	};
 
+	// Conditional stream_options (some providers may reject this)
+	if (compat.supportsUsageInStreaming !== false) {
+		params.stream_options = { include_usage: true };
+	}
+
+	// Store parameter (opt-out of OpenAI's storage)
+	if (compat.supportsStore) {
+		params.store = false;
+	}
+
+	// Max tokens with field selection
 	if (options?.maxTokens) {
-		params.max_tokens = options.maxTokens;
+		if (compat.maxTokensField === "max_tokens") {
+			params.max_tokens = options.maxTokens;
+		} else {
+			params.max_completion_tokens = options.maxTokens;
+		}
 	}
 
 	if (options?.temperature !== undefined) {
 		params.temperature = options.temperature;
+	}
+
+	// Tool choice support
+	if (options?.toolChoice) {
+		params.tool_choice = options.toolChoice;
 	}
 
 	// Add tools if present
@@ -308,6 +400,7 @@ function buildRequestBody(
 				name: tool.name,
 				description: tool.description,
 				parameters: tool.parameters,
+				...(compat.supportsStrictMode !== false && { strict: false }),
 			},
 		}));
 	}
@@ -337,11 +430,11 @@ function mapStopReason(reason: string | null): StopReason {
  */
 export function createStreamSimpleGwdg(
 	piEventEmitter?: { emit: (event: string, data: unknown) => void },
-): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
+): (model: Model<Api>, context: Context, options?: GwdgStreamOptions) => AssistantMessageEventStream {
 	return function streamSimpleGwdg(
 		model: Model<Api>,
 		context: Context,
-		options?: SimpleStreamOptions,
+		options?: GwdgStreamOptions,
 	): AssistantMessageEventStream {
 		const stream = createAssistantMessageEventStream();
 
