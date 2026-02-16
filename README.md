@@ -7,10 +7,10 @@ Provides dynamic model fetching for GWDG instances via OpenAI-compatible API.
 See below how to configure Authentication.
 
 ```bash
-# Install extension
+# Install package
 pi install https://github.com/perasperaadastra/pi-gwdg
 
-# Load once
+# Load extension
 git clone https://github.com/perasperaadastra/pi-gwdg
 pi -e ./pi-gwdg
 
