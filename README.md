@@ -40,7 +40,6 @@ Authentication can be configured via settings too, like:
 
 See [models.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/models.md#provider-configuration) for details.
 
-
 ## Cache
 
 Models cached to `~/.pi/agent/gwdg-models-cache.json` for 30 days.

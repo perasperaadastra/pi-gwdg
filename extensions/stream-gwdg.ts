@@ -20,8 +20,10 @@ import type {
 } from "@mariozechner/pi-ai";
 import { createAssistantMessageEventStream, getEnvApiKey, parseStreamingJson } from "@mariozechner/pi-ai";
 import { calculateCost } from "@mariozechner/pi-ai";
+import { KeyRotationManager } from "./key-rotation.js";
 
-const PI_GWDG_DEBUG = process.env.PI_GWDG_DEBUG === "1"
+const PI_GWDG_DEBUG = process.env.PI_GWDG_DEBUG === "1";
+const FALLBACK_THRESHOLD_SECONDS = 3600;
 
 function debug(...args: unknown[]): void {
 	if (PI_GWDG_DEBUG) {
@@ -432,6 +434,8 @@ function mapStopReason(reason: string | null): StopReason {
  */
 export function createStreamSimpleGwdg(
 	piEventEmitter?: { emit: (event: string, data: unknown) => void },
+	fallbackBaseUrl?: string,
+	keyRotationManager?: KeyRotationManager,
 ): (model: Model<Api>, context: Context, options?: GwdgStreamOptions) => AssistantMessageEventStream {
 	return function streamSimpleGwdg(
 		model: Model<Api>,
@@ -459,96 +463,162 @@ export function createStreamSimpleGwdg(
 				timestamp: Date.now(),
 			};
 
-			try {
-				const apiKey = options?.apiKey || getEnvApiKey(model.provider);
+			// Track current key ID for rate limit updates
+			let currentKeyId: number | undefined;
 
+			try {
 				debug("streamSimpleGwdg: model:", model.id, "baseUrl:", model.baseUrl);
 				debug("streamSimpleGwdg: piEventEmitter:", piEventEmitter ? "defined" : "undefined");
+				debug("streamSimpleGwdg: keyRotationManager:", keyRotationManager ? "defined" : "undefined");
 
-				// Check if we have a stored rate limit reset time
-				const cachedReset = rateLimitResetTimes.get(model.baseUrl);
-				if (cachedReset) {
-					const nowSeconds = Math.floor(Date.now() / 1000);
-					if (cachedReset.resetTimestamp > nowSeconds) {
-						const waitSeconds = cachedReset.resetTimestamp - nowSeconds;
-						const resetTimeStr = new Date(cachedReset.resetTimestamp * 1000).toLocaleTimeString(
-							undefined,
-							{ hour: "2-digit", minute: "2-digit", second: "2-digit" },
-						);
-						output.errorMessage = `Waiting for rate limit reset (~${waitSeconds}s, until ${resetTimeStr})`;
-						stream.push({ type: "status", content: output.errorMessage, partial: output });
-						debug("Waiting for rate limit reset:", waitSeconds, "seconds");
-						await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
-						rateLimitResetTimes.delete(model.baseUrl);
-					}
-				}
-
-				// Build headers
-				const headers: Record<string, string> = {
-					"Content-Type": "application/json",
-					Accept: "text/event-stream",
-				};
-
-				if (apiKey) {
-					headers["Authorization"] = `Bearer ${apiKey}`;
-				}
-
-				// Add custom headers from options
-				if (options?.headers) {
-					Object.assign(headers, options.headers);
-				}
-
-				// Build request body
+				// Build request body (same for all attempts)
 				const body = buildRequestBody(model as Model<"openai-completions">, context, options);
 
-				debug("Making request to", model.baseUrl, "with model", model.id);
+				/**
+				 * Make a request with key rotation support
+				 */
+				const attemptRequest = async (): Promise<Response | null> => {
+					// Get the best available key
+					const keyStatus = keyRotationManager?.getBestAvailableKey();
 
-				// Make the request
-				const response = await fetch(`${model.baseUrl}/chat/completions`, {
-					method: "POST",
-					headers,
-					body: JSON.stringify(body),
-					signal: options?.signal,
-				});
+					if (!keyStatus) {
+						// All keys exhausted - check if we can wait for reset
+						if (keyRotationManager) {
+							const earliestReset = keyRotationManager.getEarliestResetTime();
+							if (earliestReset) {
+								const nowSeconds = Math.floor(Date.now() / 1000);
+								const waitSeconds = earliestReset - nowSeconds;
+								if (waitSeconds > 0 && waitSeconds <= 300) {
+									// Only wait if it's reasonable (5 minutes or less)
+									const resetTimeStr = new Date(earliestReset * 1000).toLocaleTimeString(
+										undefined,
+										{ hour: "2-digit", minute: "2-digit", second: "2-digit" },
+									);
+									output.errorMessage = `All API keys rate limited. Waiting ${waitSeconds}s until ${resetTimeStr}...`;
+									stream.push({ type: "status", content: output.errorMessage, partial: output });
+									debug("All keys rate limited, waiting:", waitSeconds, "seconds");
+									await new Promise((resolve) => setTimeout(resolve, waitSeconds * 1000));
+									return attemptRequest(); // Retry after wait
+								}
+							}
+						}
 
-				// CRITICAL: Capture headers immediately after response
-				debug("Response status:", response.status);
+						// Get key from options or environment as fallback
+						const fallbackKey = options?.apiKey || getEnvApiKey(model.provider);
+						if (!fallbackKey) {
+							output.errorMessage = "All API keys are exhausted";
+							stream.push({ type: "error", reason: "error", error: output });
+							stream.end();
+							return null;
+						}
+
+						// Try with fallback key (no rotation tracking)
+						debug("Attempting request with fallback key (no rotation tracking)");
+						console.warn(`[GWDG] All rotation keys exhausted, using fallback key (no rotation tracking)`);
+
+						const headers: Record<string, string> = {
+							"Content-Type": "application/json",
+							Accept: "text/event-stream",
+							Authorization: `Bearer ${fallbackKey}`,
+						};
+
+						if (options?.headers) {
+							Object.assign(headers, options.headers);
+						}
+
+						return fetch(`${model.baseUrl}/chat/completions`, {
+							method: "POST",
+							headers,
+							body: JSON.stringify(body),
+							signal: options?.signal,
+						});
+					}
+
+					// Track current key for rate limit updates
+					currentKeyId = keyStatus.id;
+					debug("Using key ID:", keyStatus.id);
+					console.info(`[GWDG] Starting request with key ${keyStatus.id} (${keyStatus.key.slice(0, 8)}...)`);
+
+
+					// Build headers with this key
+					const headers: Record<string, string> = {
+						"Content-Type": "application/json",
+						Accept: "text/event-stream",
+					};
+					headers["Authorization"] = `Bearer ${keyStatus.key}`;
+
+					// Add custom headers from options
+					if (options?.headers) {
+						Object.assign(headers, options.headers);
+					}
+
+					// Determine which URL to use
+					let currentBaseUrl = model.baseUrl;
+
+					// Check if we have a stored rate limit reset time for the primary URL
+					const cachedReset = rateLimitResetTimes.get(model.baseUrl);
+					if (cachedReset && fallbackBaseUrl) {
+						const nowSeconds = Math.floor(Date.now() / 1000);
+						if (cachedReset.resetTimestamp > nowSeconds) {
+							const waitSeconds = cachedReset.resetTimestamp - nowSeconds;
+							if (waitSeconds > FALLBACK_THRESHOLD_SECONDS) {
+								// Primary endpoint has long rate limit, try fallback
+								debug(`Primary endpoint rate limited for ${waitSeconds}s, trying fallback`);
+								stream.push({
+									type: "status",
+									content: `Primary endpoint rate limited, trying fallback...`,
+									partial: output,
+								});
+								currentBaseUrl = fallbackBaseUrl;
+							}
+						}
+					}
+
+					// Make request
+					const response = await fetch(`${currentBaseUrl}/chat/completions`, {
+						method: "POST",
+						headers,
+						body: JSON.stringify(body),
+						signal: options?.signal,
+					});
+
+					// Check if we should rotate keys
+					if (keyRotationManager && keyRotationManager.shouldRotateOnError(response.status)) {
+						const rotated = keyRotationManager.updateKeyStatus(keyStatus.id, response);
+						if (rotated) {
+							const nextKey = keyRotationManager.getBestAvailableKey();
+							if (nextKey) {
+								debug(`Key ${keyStatus.id} rate limited, switching to key ${nextKey.id}`);
+								console.info(`[GWDG] Rotating from key ${keyStatus.id} to key ${nextKey.id}`);
+
+								stream.push({
+									type: "status",
+									content: `API key rate limited, switching to alternative key...`,
+									partial: output,
+								});
+								return attemptRequest(); // Retry with next key
+							}
+						}
+					}
+
+					return response;
+				};
+
+				const response = await attemptRequest();
+				if (!response) return; // Error already handled
+
+				// Get the base URL that was used (might be fallback)
+				const currentBaseUrl = response.url.replace('/chat/completions', '');
 
 				if (!response.ok) {
 					const errorText = await response.text();
 					debug("Error response:", response.status, errorText);
 
-					// Try to extract rate limit info even on error
-					emitRateLimits(response, piEventEmitter, model.baseUrl);
+					emitRateLimits(response, piEventEmitter, currentBaseUrl);
 
-					// Check if rate limited
-					if (response.status === 429) {
-						const resetHeader =
-							response.headers.get("ratelimit-reset") ||
-							response.headers.get("x-ratelimit-reset");
-						const resetSeconds = resetHeader ? parseInt(resetHeader, 10) : undefined;
-
-						let rateLimitInfo = "";
-						if (resetSeconds && !isNaN(resetSeconds)) {
-							const resetTimestamp = Math.floor(Date.now() / 1000) + resetSeconds;
-
-							// Store for next request
-							rateLimitResetTimes.set(model.baseUrl, { resetTimestamp });
-
-							const resetDate = new Date(resetTimestamp * 1000);
-							const resetTimeStr = resetDate.toLocaleTimeString(undefined, {
-								hour: "2-digit",
-								minute: "2-digit",
-								second: "2-digit",
-							});
-							rateLimitInfo = `\n(waiting until ${resetTimeStr}, ~${resetSeconds}s)`;
-						}
-
-						output.stopReason = "error";
-						output.errorMessage = `Rate limited (429): ${errorText}${rateLimitInfo}`;
-						stream.push({ type: "error", reason: "error", error: output });
-						stream.end();
-						return;
+					// Update rotation manager on error
+					if (keyRotationManager && currentKeyId !== undefined) {
+						keyRotationManager.updateKeyStatus(currentKeyId, response);
 					}
 
 					output.stopReason = "error";
@@ -559,7 +629,7 @@ export function createStreamSimpleGwdg(
 				}
 
 				// Capture rate limit headers on success
-				emitRateLimits(response, piEventEmitter, model.baseUrl);
+				emitRateLimits(response, piEventEmitter, currentBaseUrl);
 
 				// Send start event
 				stream.push({ type: "start", partial: output });
