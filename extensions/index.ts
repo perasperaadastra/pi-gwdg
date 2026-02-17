@@ -30,9 +30,9 @@ const GWDG_ASYNC_INIT = process.env.GWDG_ASYNC_INIT === "true";
 const GWDG_API_KEY_NAME = "GWDG_API_KEY";
 
 function debug(...args: unknown[]): void {
-  if (GWDG_DEBUG) {
-    console.log("[GWDG EXTENSION DEBUG]", ...args);
-  }
+    if (GWDG_DEBUG) {
+        console.log("[GWDG EXTENSION DEBUG]", ...args);
+    }
 }
 
 let gwdgSetupDone = false;
