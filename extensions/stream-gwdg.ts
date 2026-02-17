@@ -21,10 +21,10 @@ import type {
 import { createAssistantMessageEventStream, getEnvApiKey, parseStreamingJson } from "@mariozechner/pi-ai";
 import { calculateCost } from "@mariozechner/pi-ai";
 
-const GWDG_DEBUG = process.env.GWDG_DEBUG === "1";
+const PI_GWDG_DEBUG = process.env.PI_GWDG_DEBUG === "1"
 
 function debug(...args: unknown[]): void {
-	if (GWDG_DEBUG) {
+	if (PI_GWDG_DEBUG) {
 		console.log("[GWDG STREAM DEBUG]", ...args);
 	}
 }

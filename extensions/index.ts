@@ -6,7 +6,7 @@
  *
  * Usage:
  *   # If auth required:
- *   export GWDG_API_KEY=your-key
+ *   export PI_GWDG_API_KEY=your-key
  *
  *   # Load extension
  *   pi -e ./pi-gwdg
@@ -25,12 +25,12 @@ const CACHE_FILE_TTL = 30 * 24 * 60 * 60 * 1000; // 30 days on disk
 const CACHE_DIR = join(getAgentDir(), "cache", "pi-gwdg");
 const CACHE_FILE = join(CACHE_DIR, "models-cache.json");
 
-const GWDG_DEBUG = process.env.GWDG_DEBUG === "1";
-const GWDG_ASYNC_INIT = process.env.GWDG_ASYNC_INIT === "true";
-const GWDG_API_KEY_NAME = "GWDG_API_KEY";
+const PI_GWDG_DEBUG = process.env.PI_GWDG_DEBUG === "1"
+const PI_GWDG_ASYNC_INIT = process.env.PI_GWDG_ASYNC_INIT === "true"
+const PI_GWDG_API_KEY_NAME = "PI_GWDG_API_KEY";
 
 function debug(...args: unknown[]): void {
-    if (GWDG_DEBUG) {
+    if (PI_GWDG_DEBUG) {
         console.log("[GWDG EXTENSION DEBUG]", ...args);
     }
 }
@@ -73,7 +73,7 @@ async function registerProvider(pi: ExtensionAPI | undefined, ctx: ExtensionCont
     debug("registerProvider: pi:", pi ? "defined" : "undefined", "ctx:", ctx ? "defined" : "undefined");
     const config = {
         baseUrl,
-        apiKey: GWDG_API_KEY_NAME,
+        apiKey: PI_GWDG_API_KEY_NAME,
         api: "openai-completions" as const,
         models: models,
         streamSimple: createStreamSimpleGwdg(pi.events),
@@ -143,10 +143,10 @@ async function loadModelsFromAPI(ctx: ExtensionContext | undefined): Promise<Mod
     let apiKeySet: boolean;
     if (ctx) {
         apiKey = await ctx.modelRegistry.getApiKeyForProvider("gwdg");
-        apiKeySet = apiKey != GWDG_API_KEY_NAME;
+        apiKeySet = apiKey != PI_GWDG_API_KEY_NAME;
     } else {
-        apiKey = process.env[GWDG_API_KEY_NAME];
-        apiKeySet = !!apiKey
+        apiKey = process.env[PI_GWDG_API_KEY_NAME];
+        apiKeySet = !!apiKey;
     }
     debug("apiKey present:", apiKeySet);
     if (!apiKeySet) {
@@ -258,9 +258,9 @@ async function refreshModels(
 }
 
 export default async function (pi: ExtensionAPI) {
-    debug("extension loading, GWDG_ASYNC_INIT:", GWDG_ASYNC_INIT);
+    debug("extension loading, PI_GWDG_ASYNC_INIT:", PI_GWDG_ASYNC_INIT);
 
-    if (!GWDG_ASYNC_INIT) {
+    if (!PI_GWDG_ASYNC_INIT) {
         debug("starting blocking setup")
         await refreshModels(pi, undefined);
         gwdgSetupDone = true;
@@ -300,7 +300,7 @@ export default async function (pi: ExtensionAPI) {
     // maybe possible at one point
     if ("registerEnvVar" in pi) {
         debug("registering env vars")
-        pi.registerEnvVar("GWDG_API_KEY", {
+        pi.registerEnvVar("PI_GWDG_API_KEY", {
             description: "GWDG provider API key (optional, from pi-gwdg extension)"
         });
     }

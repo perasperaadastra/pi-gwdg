@@ -28,13 +28,13 @@ See [packages.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-
 ## Configuration
 
 ```bash
-export GWDG_API_KEY=your-key      # Authentication required
-export GWDG_DEBUG=1               # Optional: Enable debug logging
-export GWDG_ASYNC_INIT=true       # Optional: Enable async initialization
+export PI_GWDG_API_KEY=your-key      # Authentication required
+export PI_GWDG_DEBUG=1               # Optional: Enable debug logging
+export PI_GWDG_ASYNC_INIT=true       # Optional: Enable async initialization
 ```
 
 Authentication can be configured via settings too, like:
-- **Environment variable:** `MY_GWDG_API_KEY_VARIABLE` (uses the variable value)
+- **Environment variable:** `MY_PI_GWDG_API_KEY_VARIABLE` (uses the variable value)
 - **Shell command:** `!op read 'op://vault/item/key'` (executes and uses stdout)
 - **Literal value:** `sk-...` (used directly)
 
