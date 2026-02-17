@@ -210,7 +210,9 @@ async function refreshModelsFromAPI(
     const models = await loadModelsFromAPI(ctx);
     if (models.length === 0) {
         debug("no models available from api");
-        ctx.ui.setStatus("GWDG", "No models available. Check GWDG service.");
+        if (ctx) {
+            ctx.ui.setStatus("GWDG", "No models available. Check GWDG service.");
+        }
         return [];
     }
     await refreshProvider(pi, ctx, models, "API");
@@ -252,7 +254,9 @@ async function refreshModels(
         return models;
     } catch (error) {
         debug("refreshModels failed:", error);
-        ctx?.ui?.notify("Failed to load GWDG models: " + (error as Error).message, "error");
+        if (ctx) {
+            ctx.ui.notify("Failed to load GWDG models: " + (error as Error).message, "error");
+        }
         return [];
     }
 }
