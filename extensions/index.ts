@@ -16,6 +16,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import type { Model } from "@mariozechner/pi-ai";
 import { getAgentDir } from "@mariozechner/pi-coding-agent";
 import { createStreamSimpleGwdg } from "./stream-gwdg.js";
+import { KeyRotationManager, createKeyRotationManager, type RotationStrategy } from "./key-rotation.js";
 import { readFile, writeFile, mkdir } from "fs/promises";
 import { existsSync } from "fs";
 import { join } from "path";
@@ -29,6 +30,14 @@ const PI_GWDG_DEBUG = process.env.PI_GWDG_DEBUG === "1"
 const PI_GWDG_ASYNC_INIT = process.env.PI_GWDG_ASYNC_INIT === "true"
 const PI_GWDG_API_KEY_NAME = "PI_GWDG_API_KEY";
 
+// Initialize key rotation manager
+const keyRotationManager = createKeyRotationManager({
+  baseKeyName: PI_GWDG_API_KEY_NAME,
+  strategy: (process.env.PI_GWDG_KEY_ROTATION as RotationStrategy) || "fallback",
+  errorCodes: process.env.PI_GWDG_KEY_ROTATION_ERRORS?.split(",").map(Number) || [429],
+  maxAttempts: parseInt(process.env.PI_GWDG_MAX_KEY_ATTEMPTS || "0", 10) || 0,
+});
+
 function debug(...args: unknown[]): void {
     if (PI_GWDG_DEBUG) {
         console.log("[GWDG EXTENSION DEBUG]", ...args);
@@ -41,8 +50,8 @@ let gwdgSetupInProgress = false;
 
 // GWDG endpoints
 const GWDG_ENDPOINTS = [
-    "https://saia.gwdg.de/v1/",
-    "https://chat-ai.academiccloud.de/v1/"
+    "https://chat-ai.academiccloud.de/v1/",
+    "https://saia.gwdg.de/v1/"
 ];
 
 // Helper to get base URL without trailing slash
@@ -50,8 +59,14 @@ function getBaseUrl(): string {
     return GWDG_ENDPOINTS[0].replace(/\/$/, '');
 }
 
+// Helper to get fallback URL
+function getFallbackUrl(): string | undefined {
+    const fallback = GWDG_ENDPOINTS[1];
+    return fallback ? fallback.replace(/\/$/, '') : undefined;
+}
+
 interface CacheData {
-  models: Model[];
+  models: Model<"openai-completions">[];
   timestamp: number;
   baseUrl: string;
 }
@@ -67,20 +82,23 @@ interface ProviderModel {
   owned_by?: string;
 }
 
-async function registerProvider(pi: ExtensionAPI | undefined, ctx: ExtensionContext | undefined, models: Model<"openai-completions">[]) {
+async function registerProvider(pi: ExtensionAPI, ctx: ExtensionContext | undefined, models: Model<"openai-completions">[]) {
     const baseUrl = getBaseUrl();
-    debug("registerProvider: pi.events:", pi?.events ? "defined" : "undefined");
+    const fallbackUrl = getFallbackUrl();
     debug("registerProvider: pi:", pi ? "defined" : "undefined", "ctx:", ctx ? "defined" : "undefined");
+    debug("registerProvider: pi.events:", pi.events ? "defined" : "undefined");
+    debug("registerProvider: baseUrl:", baseUrl, "fallbackUrl:", fallbackUrl);
+    debug("registerProvider: keyRotationManager has", keyRotationManager.getKeyCount(), "keys");
     const config = {
         baseUrl,
         apiKey: PI_GWDG_API_KEY_NAME,
         api: "openai-completions" as const,
         models: models,
-        streamSimple: createStreamSimpleGwdg(pi.events),
+        streamSimple: createStreamSimpleGwdg(pi.events, fallbackUrl, keyRotationManager),
     };
     if (ctx) {
         ctx.modelRegistry.registerProvider("gwdg", config);
-    } else if (pi) {
+    } else {
         pi.registerProvider("gwdg", config);
     }
     debug("provider registered with", models.length, "models");
@@ -139,21 +157,23 @@ async function saveModelsToFile(cache: CacheData): Promise<void> {
 async function loadModelsFromAPI(ctx: ExtensionContext | undefined): Promise<Model<"openai-completions">[]> {
     const baseUrl = getBaseUrl();
 
-    let apiKey: string | undefined;
-    let apiKeySet: boolean;
-    if (ctx) {
-        apiKey = await ctx.modelRegistry.getApiKeyForProvider("gwdg");
-        apiKeySet = apiKey != PI_GWDG_API_KEY_NAME;
-    } else {
-        apiKey = process.env[PI_GWDG_API_KEY_NAME];
-        apiKeySet = !!apiKey;
-    }
-    debug("apiKey present:", apiKeySet);
-    if (!apiKeySet) {
-        ctx?.ui.notify("GWDG API key missing!", "warning");
-        debug("loadModelsFromAPI: API key not set");
+    // Get the best available key from rotation manager
+    const keyStatus = keyRotationManager.getBestAvailableKey();
+    if (!keyStatus) {
+        // Check if we have keys but they're all rate limited
+        if (keyRotationManager.getKeyCount() > 0) {
+            ctx?.ui.notify("All GWDG API keys are rate limited or exhausted!", "error");
+            debug("loadModelsFromAPI: no keys available, all rate limited or exhausted");
+        } else {
+            ctx?.ui.notify("GWDG API key missing!", "warning");
+            debug("loadModelsFromAPI: API key not set");
+        }
         return [];
     }
+
+    const apiKey = keyStatus.key;
+    debug("loadModelsFromAPI: using key ID", keyStatus.id);
+    const apiKeySet = true;
 
     ctx?.ui.setStatus("GWDG", "Fetching models...");
 
@@ -171,7 +191,7 @@ async function loadModelsFromAPI(ctx: ExtensionContext | undefined): Promise<Mod
     const data = (await response.json()) as { data: ProviderModel[] };
     debug("loadModelsFromAPI: got", data.data.length, "models from API");
 
-    const models =  data.data.map((m) => ({
+    const models: Model<"openai-completions">[] = data.data.map((m) => ({
         id: m.id,
         name: m.name ?? m.id,
         reasoning: false,
