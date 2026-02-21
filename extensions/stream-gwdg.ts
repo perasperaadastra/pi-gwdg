@@ -537,7 +537,7 @@ export function createStreamSimpleGwdg(
 					// Track current key for rate limit updates
 					currentKeyId = keyStatus.id;
 					debug("Using key ID:", keyStatus.id);
-					console.info(`[GWDG] Starting request with key ${keyStatus.id} (${keyStatus.key.slice(0, 8)}...)`);
+					debug(`Starting request with key ${keyStatus.id} (${keyStatus.key.slice(0, 8)}...)`);
 
 
 					// Build headers with this key
@@ -589,7 +589,7 @@ export function createStreamSimpleGwdg(
 							const nextKey = keyRotationManager.getBestAvailableKey();
 							if (nextKey) {
 								debug(`Key ${keyStatus.id} rate limited, switching to key ${nextKey.id}`);
-								console.info(`[GWDG] Rotating from key ${keyStatus.id} to key ${nextKey.id}`);
+								debug(`Rotating from key ${keyStatus.id} to key ${nextKey.id}`);
 
 								stream.push({
 									type: "status",
