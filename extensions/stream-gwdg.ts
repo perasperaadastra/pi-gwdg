@@ -478,8 +478,21 @@ export function createStreamSimpleGwdg(
 				 * Make a request with key rotation support
 				 */
 				const attemptRequest = async (): Promise<Response | null> => {
-					// Get the best available key
-					const keyStatus = keyRotationManager?.getBestAvailableKey();
+					// Get the best available key (with switch-back detection)
+					const keySelection = keyRotationManager?.getBestAvailableKeyWithSwitchBack();
+					const keyStatus = keySelection?.key;
+
+					// Check if we switched back to a preferred (lower-ID) key
+					if (keySelection && keySelection.switchedBack) {
+						debug(`Switching back to preferred key ${keyStatus.id} (was using key ${keySelection.previousKeyId})`);
+						if (piEventEmitter) {
+							const message = `API key ${keyStatus.id} is available again, switching back from key ${keySelection.previousKeyId}`;
+							// Note: sessionId is currently not included, so notification will broadcast to all active sessions
+							// This is the intended behavior since key rotation affects all sessions
+							piEventEmitter.emit("gwdg:key:switch-back", { message, type: "info" as const });
+							debug("Emitted gwdg:key:switch-back event (broadcast to all sessions):", message);
+						}
+					}
 
 					if (!keyStatus) {
 						// All keys exhausted - check if we can wait for reset
@@ -590,6 +603,13 @@ export function createStreamSimpleGwdg(
 							if (nextKey) {
 								debug(`Key ${keyStatus.id} rate limited, switching to key ${nextKey.id}`);
 								debug(`Rotating from key ${keyStatus.id} to key ${nextKey.id}`);
+
+								// Emit rotation notification
+								if (piEventEmitter) {
+									const message = `Rate limited: switching from API key ${keyStatus.id} to key ${nextKey.id}`;
+									piEventEmitter.emit("gwdg:key:rotate", { message, type: "warning" as const });
+									debug("Emitted gwdg:key:rotate event:", message);
+								}
 
 								stream.push({
 									type: "status",

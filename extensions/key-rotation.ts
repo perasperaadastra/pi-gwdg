@@ -673,6 +673,71 @@ export class KeyRotationManager {
 	  getKeyDiscoveryStats(): KeyDiscoveryStats {
 		    return { ...this.discoveryStats };
 	  }
+
+	  /**
+	   * Get a formatted wait time message for all rate-limited keys
+	   * Returns null if no keys are waiting for reset
+	   */
+	  getWaitTimeMessage(): string | null {
+		    const earliestReset = this.getEarliestResetTime();
+		    if (!earliestReset) {
+			      return null;
+		    }
+
+		    const nowSeconds = Math.floor(Date.now() / 1000);
+		    const waitSeconds = earliestReset - nowSeconds;
+
+		    // Find which key has the earliest reset
+		    const earliestKeyId = this.keys.find(k => k.resetTimestamp === earliestReset)?.id;
+
+		    const resetTimeStr = new Date(earliestReset * 1000).toLocaleTimeString(
+			      undefined,
+			      { hour: "2-digit", minute: "2-digit", second: "2-digit" }
+		    );
+
+		    return `Next API key (ID ${earliestKeyId}) will be available in ${waitSeconds}s at ${resetTimeStr}`;
+	  }
+
+	  /**
+	   * Track the last key that was selected for use
+	   * Used to detect when switching back to a preferred key
+	   */
+	  private lastSelectedKeyId: number | null = null;
+
+	  /**
+	   * Get the best available key and detect if we're switching back to a preferred key
+	   * Returns null if no keys are available
+	   *
+	   * This method is similar to getBestAvailableKey() but also tracks the transition
+	   * and can detect when switching back to a lower-ID key (which just became available)
+	   */
+	  getBestAvailableKeyWithSwitchBack(): { key: KeyStatus; switchedBack: boolean; previousKeyId: number | null } | null {
+		    const key = this.getBestAvailableKey();
+		    if (!key) {
+			      return null;
+		    }
+
+		    const previousKeyId = this.lastSelectedKeyId;
+		    const switchedBack = previousKeyId !== null && key.id < previousKeyId;
+
+		    // Update tracking
+		    this.lastSelectedKeyId = key.id;
+
+		    if (switchedBack) {
+			      krDebug(`Switching back to preferred key ${key.id} (was using key ${previousKeyId})`);
+		    }
+
+		    return { key, switchedBack, previousKeyId };
+	  }
+
+	  /**
+	   * Reset the last selected key tracking
+	   * Call this when starting a new session or manually resetting keys
+	   */
+	  resetLastSelectedKey(): void {
+		    krDebug("Resetting last selected key tracking");
+		    this.lastSelectedKeyId = null;
+	  }
 }
 
 /**

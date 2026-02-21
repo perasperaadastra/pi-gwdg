@@ -28,6 +28,7 @@ const CACHE_FILE = join(CACHE_DIR, "models-cache.json");
 
 const PI_GWDG_DEBUG = process.env.PI_GWDG_DEBUG === "1"
 const PI_GWDG_ASYNC_INIT = process.env.PI_GWDG_ASYNC_INIT === "true"
+const PI_GWDG_NOTIFY_ON_ROTATION = process.env.PI_GWDG_NOTIFY_ON_ROTATION !== "false"
 const PI_GWDG_API_KEY_NAME = "PI_GWDG_API_KEY";
 
 // Initialize key rotation manager
@@ -162,7 +163,11 @@ async function loadModelsFromAPI(ctx: ExtensionContext | undefined): Promise<Mod
     if (!keyStatus) {
         // Check if we have keys but they're all rate limited
         if (keyRotationManager.getKeyCount() > 0) {
-            ctx?.ui.notify("All GWDG API keys are rate limited or exhausted!", "error");
+            const waitMessage = keyRotationManager.getWaitTimeMessage();
+            const message = waitMessage
+                ? `All GWDG API keys are rate limited!\n${waitMessage}`
+                : "All GWDG API keys are exhausted!";
+            ctx?.ui.notify(message, "error");
             debug("loadModelsFromAPI: no keys available, all rate limited or exhausted");
         } else {
             ctx?.ui.notify("GWDG API key missing!", "warning");
@@ -281,8 +286,75 @@ async function refreshModels(
     }
 }
 
+// Track active sessions and their contexts for per-session notifications
+// Maps sessionId -> ExtensionContext
+const activeSessions = new Map<string, ExtensionContext>();
+
+// Track event listeners for cleanup on session shutdown
+// Maps sessionId -> Array of listener cleanup functions
+const sessionListeners = new Map<string, Array<() => void>>();
+
 export default async function (pi: ExtensionAPI) {
     debug("extension loading, PI_GWDG_ASYNC_INIT:", PI_GWDG_ASYNC_INIT);
+
+    /**
+     * Session-specific notification handler
+     * Creates per-session event listeners that only notify their own session
+     */
+    const setupSessionListeners = (sessionId: string, ctx: ExtensionContext) => {
+        const listeners: Array<() => void> = [];
+
+        // Listen for key rotation events
+        const rotateHandler = (data: { message: string; type: "info" | "warning" | "error", sessionId?: string }) => {
+            if (!PI_GWDG_NOTIFY_ON_ROTATION) {
+                return;
+            }
+
+            // If event has sessionId, only show in that specific session
+            // If event has no sessionId, show in all active sessions (broadcast)
+            if (data.sessionId !== undefined && data.sessionId !== sessionId) {
+                // Event belongs to a different session, skip
+                debug(`[Session ${sessionId}] Skipping rotation event for session ${data.sessionId}`);
+                return;
+            }
+
+            const targetSession = data.sessionId !== undefined ? `Session ${data.sessionId}` : "all sessions";
+            console.log(`[GWDG NOTIFICATION - Session ${sessionId}] ${data.type.toUpperCase()} (${targetSession}): ${data.message}`);
+            ctx.ui.notify(data.message, data.type);
+        };
+        // pi.events.on returns a cleanup function
+        const rotateCleanup = pi.events.on("gwdg:key:rotate", rotateHandler);
+        listeners.push(rotateCleanup);
+        debug(`[Session ${sessionId}] gwdg:key:rotate listener registered`);
+
+        // Listen for key switch-back events
+        const switchBackHandler = (data: { message: string; type: "info" | "warning" | "error", sessionId?: string }) => {
+            if (!PI_GWDG_NOTIFY_ON_ROTATION) {
+                return;
+            }
+
+            // If event has sessionId, only show in that specific session
+            // If event has no sessionId, show in all active sessions (broadcast)
+            if (data.sessionId !== undefined && data.sessionId !== sessionId) {
+                debug(`[Session ${sessionId}] Skipping switch-back event for session ${data.sessionId}`);
+                return;
+            }
+
+            const targetSession = data.sessionId !== undefined ? `Session ${data.sessionId}` : "all sessions";
+            console.log(`[GWDG NOTIFICATION - Session ${sessionId}] ${data.type.toUpperCase()} (${targetSession}): ${data.message}`);
+            ctx.ui.notify(data.message, data.type);
+        };
+        // pi.events.on returns a cleanup function
+        const switchBackCleanup = pi.events.on("gwdg:key:switch-back", switchBackHandler);
+        listeners.push(switchBackCleanup);
+        debug(`[Session ${sessionId}] gwdg:key:switch-back listener registered`);
+
+        // Store listeners for cleanup
+        sessionListeners.set(sessionId, listeners);
+
+        return listeners;
+    };
+
 
     if (!PI_GWDG_ASYNC_INIT) {
         debug("starting blocking setup")
@@ -295,20 +367,56 @@ export default async function (pi: ExtensionAPI) {
     }
 
     pi.on("session_start", async (_args, ctx) => {
+        // Get or generate session ID
+        const sessionId = ctx.sessionManager.getSessionId();
+        debug(`[Session ${sessionId}] Session started, setting up listeners`);
+
+        // Track this session for notifications
+        activeSessions.set(sessionId, ctx);
+
+        // Set up session-specific event listeners
+        setupSessionListeners(sessionId, ctx);
+
         if (!gwdgSetupDone && !gwdgSetupFailed && !gwdgSetupInProgress) {
             gwdgSetupInProgress = true;
-            debug("starting async setup")
+            debug(`[Session ${sessionId}] Starting async setup`);
             try {
                 await refreshModels(pi, ctx);
                 gwdgSetupDone = true;
-                debug("finished async setup")
+                debug(`[Session ${sessionId}] Finished async setup`);
             } catch (error) {
-                debug("async setup failed:", error);
+                debug(`[Session ${sessionId}] Async setup failed:`, error);
                 gwdgSetupFailed = true;
                 ctx.ui.notify("GWDG setup failed: " + (error as Error).message, "error");
             } finally {
                 gwdgSetupInProgress = false;
             }
+        }
+    });
+
+    pi.on("session_shutdown", async (_args, ctx) => {
+        // Clean up session-specific listeners
+        const sessionId = ctx.sessionManager.getSessionId();
+        debug(`[Session ${sessionId}] Session shutting down, cleaning up listeners`);
+
+        // Remove event listeners for this session
+        const listeners = sessionListeners.get(sessionId);
+        if (listeners) {
+            for (const cleanup of listeners) {
+                try {
+                    cleanup();
+                } catch (e) {
+                    debug(`[Session ${sessionId}] Error cleaning up listener:`, e);
+                }
+            }
+            sessionListeners.delete(sessionId);
+            debug(`[Session ${sessionId}] Removed ${listeners.length} event listeners`);
+        }
+
+        // Remove session from active sessions
+        const removed = activeSessions.delete(sessionId);
+        if (removed) {
+            debug(`[Session ${sessionId}] Removed from active sessions`);
         }
     });
 
