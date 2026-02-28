@@ -235,6 +235,7 @@ function emitRateLimits(
 	response: Response,
 	piEventEmitter: { emit: (event: string, data: unknown) => void } | undefined,
 	endpoint: string,
+	keyId?: number,
 ): void {
 	debug("emitRateLimits: called with endpoint:", endpoint);
 	const rateLimits = extractRateLimits(response.headers);
@@ -264,6 +265,7 @@ function emitRateLimits(
 		rateLimits,
 		resetSeconds: modResetSeconds,
 		endpoint,
+		keyId: keyId?.toString(),
 	});
 
 	debug("emitRateLimits: event emitted successfully");
@@ -634,7 +636,7 @@ export function createStreamSimpleGwdg(
 					const errorText = await response.text();
 					debug("Error response:", response.status, errorText);
 
-					emitRateLimits(response, piEventEmitter, currentBaseUrl);
+					emitRateLimits(response, piEventEmitter, currentBaseUrl, currentKeyId);
 
 					// Update rotation manager on error
 					if (keyRotationManager && currentKeyId !== undefined) {
@@ -649,7 +651,7 @@ export function createStreamSimpleGwdg(
 				}
 
 				// Capture rate limit headers on success
-				emitRateLimits(response, piEventEmitter, currentBaseUrl);
+				emitRateLimits(response, piEventEmitter, currentBaseUrl, currentKeyId);
 
 				// Send start event
 				stream.push({ type: "start", partial: output });
