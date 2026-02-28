@@ -42,7 +42,7 @@ See [models.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-ag
 
 ## Cache
 
-Models cached to `~/.pi/agent/gwdg-models-cache.json` for 30 days.
+Models cached to `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/cache/pi-gwdg/models-cache.json` for 30 days.
 
 To override the model list manually, see [models.md](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/models.md#minimal-example).
 
@@ -50,7 +50,8 @@ To override the model list manually, see [models.md](https://github.com/badlogic
 
 If no models appear:
 1. Run `/refresh-gwdg-models` to force refresh
-2. Check `~/.pi/agent/gwdg-models-cache.json` exists
+2. Check `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/cache/pi-gwdg/models-cache.json` exists
+
 3. Ensure GWDG service is accessible
 
 - Extension will fail gracefully with empty models until key is set
