@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "es2022",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": "extensions",
+    "declaration": false,
+    "sourceMap": false
+  },
+  "include": ["extensions/*.ts"]
+}
