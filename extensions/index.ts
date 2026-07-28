@@ -238,7 +238,7 @@ class RateLimitBanner extends Loader {
      * the extra one to avoid a double gap above the editor.
      */
     render(width: number): string[] {
-        return super.render(width).slice(1);
+        return [...super.render(width).slice(1), ""];
     }
 
     /** Called by pi when the widget is replaced, cleared, or the UI is reset. */
