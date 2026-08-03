@@ -5,8 +5,8 @@
 > [rate-limiting.md](./rate-limiting.md).
 
 The extension wraps **`globalThis.fetch`** (a `fetch` interceptor installed at
-provider registration, `installFetchInterceptor`) to observe and reshape 429
-responses before the OpenAI SDK acts on them.
+provider registration, `installFetchInterceptor`) to observe and reshape
+rate-limited responses before the OpenAI SDK acts on them.
 
 **Background:** The `openai-completions` API type uses the OpenAI SDK internally.
 The SDK throws on non-2xx HTTP responses (including 429) **before** the
@@ -20,17 +20,18 @@ prototype monkey-patch on the extension's copy would never fire.
 The wrapper is symbol-guarded (`__gwdgFetchPatched`) and scoped to the GWDG
 provider host. Everything else passes through untouched.
 
-## 429 Flow (fetch interceptor)
+## Rate-Limit Flow (fetch interceptor)
 
-0. **Pre-flight** (`waitForSharedRateLimit`, before `originalFetch`): host-matched read of the cross-session state file. If a peer published a still-active reset that is within `getMaxRateLimitWaitSec()`, wait it out with the same `abortableDelay` + banner as the 429 wait path. See [Cross-Session Rate-Limit State](#cross-session-rate-limit-state-extensionsshared-statets) below.
-1. HTTP 429 response received from the GWDG API; the wrapper matches the provider host.
-2. Extract `x-ratelimit-*-{minute,hour,day,month}` + `retry-after` headers; store `RateLimitWindows` in the module-level singleton (`setRateLimitState`); emit `pi:rate-limited` (if `emitRateLimitEvents`).
-3. Compute the **true** provider reset (uncapped): `retry-after` → smallest exhausted window reset → `DEFAULT_RATE_LIMIT_WAIT_SEC` fallback. Publish it to the shared state file (`publishSharedRateLimitState`) **before** the wait/cancel decision, so peers hold off either way.
-4. Decide `willWait = resetSec > 0 && resetSec <= getMaxRateLimitWaitSec()`; set `pendingRateLimitCancel = !willWait` (+ `pendingRateLimitCancelDetail`) **before** firing feedback, so the feedback knows whether a rewritten error message will carry the report.
+0. **Pre-flight** (`waitForSharedRateLimit`, before `originalFetch`): host-matched read of the cross-session state file. If a peer published a still-active reset that is within `getMaxRateLimitWaitSec()`, wait it out with the same `abortableDelay` + banner as the wait path. See [Cross-Session Rate-Limit State](#cross-session-rate-limit-state-extensionsshared-statets) below.
+1. Response received from the GWDG API; the wrapper returns early unless the URL matches the provider host, so the loop below only ever sees GWDG traffic.
+2. **Harvest on every status.** Extract `x-ratelimit-*-{minute,hour,day,month}` and store the `RateLimitWindows` in the module-level singleton (`setRateLimitState`) — unconditionally, before any rate-limit decision, and only when the parse yielded at least one window (so a header-less `401` cannot blank out a good snapshot). This is the **only** place a non-2xx snapshot is ever seen: the SDK throws before `onResponse`, so `after_provider_response` fires for 2xx only — which is also why the harvest renders the footer itself via `renderQuotaFooter` (shared with the `after_provider_response` handler; needs `feedbackCtx`, so it is a no-op until the first event has been seen). Then extract `retry-after`; emit `pi:rate-limited` (if `emitRateLimitEvents`).
+2a. **Classify.** `429` → always a rate limit. `>= 500` → a rate limit only if `isQuotaExhausted(headers, windows)`, capped at `MAX_THROTTLED_SERVER_ERROR_RETRIES` (3) **per HTTP attempt** (pi's agent-session retry can start a fresh attempt with a fresh count); past the cap the loop `break`s and the response is returned untouched. Anything else `break`s immediately. `isQuotaExhausted` checks the generic `ratelimit-remaining` alias **and** the parsed windows, because on a throttled 5xx the alias (which tracks GWDG's per-second window, not in `WINDOW_PATTERNS`) is the only exhaustion signal present.
+3. Compute the **true** provider reset (uncapped): `retry-after` → smallest exhausted window reset → fallback. The fallback is `THROTTLED_SECOND_WINDOW_WAIT_SEC` (2s) for an inferred-throttle 5xx — there the exhaustion signal *was* the per-second window, so the minute-scale `DEFAULT_RATE_LIMIT_WAIT_SEC` would overshoot by two orders of magnitude — and `DEFAULT_RATE_LIMIT_WAIT_SEC` otherwise. On a **429** publish it to the shared state file (`publishSharedRateLimitState`) **before** the wait/cancel decision, so peers hold off either way; an inferred 5xx throttle is deliberately **not** published (one session's guess must not stall every peer).
+4. Decide `willWait = resetSec > 0 && resetSec <= getMaxRateLimitWaitSec()`. A non-429 that would *not* wait `break`s here and is returned untouched: the cancel path asserts "quota exceeded" and suppresses every retry layer, which must not rest on an inference. For a 429, set `pendingRateLimitCancel = !willWait` (+ `pendingRateLimitCancelDetail`) **before** firing feedback, so the feedback knows whether a rewritten error message will carry the report.
 5. Fire user feedback via `triggerRateLimitFeedback`: on the wait path, a live countdown to the **true** reset in the rate-limit banner (see below); on the cancel path, nothing — the rewritten `errorMessage` is the report (a debounced notification only fires on paths that produce no errored message).
 6. Take control of retry timing:
-   - **Wait:** `await abortableDelay(resetSec * 1000, init.signal)` **inside the interceptor**, then re-issue the request via `originalFetch` and loop on a fresh 429. The wait is done here (not delegated to the SDK via `Retry-After`) because the SDK's inter-retry sleep is **not** abortable — delegating it makes **ESC** laggy (cancel only observed after the full wait elapses); the abortable delay rejects with `AbortError` the instant `init.signal` fires, so ESC interrupts immediately.
-   - **Cancel:** rebuild the `Response` with `retry-after` deleted and `x-should-retry: false` (SDK does not retry).
+   - **Wait:** `await abortableDelay(resetSec * 1000, init.signal)` **inside the interceptor**, then re-issue the request via `originalFetch` and loop on a fresh rate limit. The wait is done here (not delegated to the SDK via `Retry-After`) because the SDK's inter-retry sleep is **not** abortable — delegating it makes **ESC** laggy (cancel only observed after the full wait elapses); the abortable delay rejects with `AbortError` the instant `init.signal` fires, so ESC interrupts immediately.
+   - **Cancel:** (429 only) rebuild the `Response` with `retry-after` deleted and `x-should-retry: false` (SDK does not retry).
 
 ## Rate-limit banner (wait path UI)
 
@@ -114,7 +115,7 @@ wording for "cancelled because of quota".
 > cancel), not a crash.
 
 The extension's role:
-- Parse rate-limit headers from **successful** responses (`after_provider_response`) and **429** responses (fetch interceptor) into the same module-level singleton.
+- Parse rate-limit headers from **successful** responses (`after_provider_response`) and **every** response the interceptor sees, whatever its status, into the same module-level singleton.
 - Make the bounded wait-vs-cancel decision and align the SDK's retry timing to the true reset.
 - Render the wait countdown in its own keyed widget (no cross-extension UI collisions).
 - Report + suppress pi's auto-retry on cancel (GWDG-scoped, via `message_end`).
@@ -200,6 +201,36 @@ working; and `/gwdg-status` should show the resolved path and the peer's reset.
 For a scripted version, spawning two node processes that load
 `extensions/index.ts` against a stub HTTP server exercises the whole path —
 pre-flight wait, 429 publish, process boundary — without real quota.
+
+**Testing the status classification** (429 vs. throttled 5xx vs. genuine 5xx vs.
+other 4xx) needs no proxy and no quota — run
+`npx tsc && node tools/verify-ratelimit-classification.mjs`. It imports
+`dist/index.js`, calls the default export with a stub `pi` (`on` records the
+handlers, the rest are no-ops), and points `baseUrl` at a local
+`http.createServer` serving a scripted queue of `[status, headers]` pairs. It
+covers all seven cases in
+[What Counts as a Rate Limit](./rate-limiting.md#what-counts-as-a-rate-limit),
+including the three asymmetries that keep a wrong 5xx inference cheap: capped
+retries, 429-only cancel, 429-only peer publish.
+
+Four things make it honest, and are worth preserving in anything similar:
+- Inject `baseUrl` through a **project config file** (`<cwd>/.pi/gwdg.json` plus
+  `process.chdir`) — there is no `PI_GWDG_BASE_URL` env var, and without this the
+  extension silently targets the real GWDG host, `providerHost` never matches, and
+  every passthrough assertion passes vacuously.
+- Assert `globalThis.__gwdgFetchPatched` **first** and bail if it is false, so that
+  failure mode is caught rather than reported as green.
+- Assert on *request counts* and *elapsed time*, not just final status — a
+  passthrough and a retried-to-failure both end in `500`, and a 2s versus a 60s
+  fallback wait is invisible in the response.
+- Keep shared state **enabled** but redirect `PI_GWDG_SHARED_STATE_DIR` to a temp
+  dir, clearing it between cases. `PI_GWDG_SHARED_STATE=0` isolates from live peers
+  but makes every "did not publish" assertion vacuous.
+
+`PI_CODING_AGENT_DIR` still points at a temp dir so the real `~/.pi/gwdg.json` and
+models cache stay out of it. When adding a behavior, confirm the new assertion
+fails without the fix — patching the built `dist/index.js` to restore the old
+behavior is the quickest way to prove the check discriminates.
 
 Notes when driving a real 429 through the proxy: the models cache is keyed by
 `baseUrl`, so a proxy `baseUrl` misses the cache — either pre-seed a cache file

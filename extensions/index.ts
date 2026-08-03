@@ -10,6 +10,21 @@
  * Successful responses: `after_provider_response` extracts the per-window
  * `x-ratelimit-*` headers and renders remaining quota in the status footer.
  *
+ * Error responses: GWDG sends the same `x-ratelimit-*` headers on every status
+ * except 401, but `after_provider_response` never fires for a non-2xx (the SDK
+ * throws first), so the fetch interceptor harvests the snapshot from EVERY
+ * response it sees, rendering the footer itself (`renderQuotaFooter`) since
+ * nothing else does for a non-2xx. Otherwise a run of failures leaves the footer
+ * and `/gwdg-status` reporting stale quota.
+ *
+ * Harvesting is separate from the wait decision: a 429 always enters it, a 5xx
+ * only when the headers show quota exhausted (GWDG's gateway returns 500 instead
+ * of 429 under throttling) and then at most MAX_THROTTLED_SERVER_ERROR_RETRIES
+ * times per HTTP attempt, so a genuine outage during an exhausted window cannot
+ * cause an unbounded retry loop. The cancel path (report + suppress all retries)
+ * is 429-only: on a 5xx the throttle is merely inferred, so a far-off reset
+ * surfaces the server error instead of asserting "quota exceeded".
+ *
  * 429 responses: these are handled entirely INSIDE the OpenAI SDK — it retries
  * non-2xx responses, honouring `Retry-After`, within a single request. As a
  * result NO pi extension event ever observes an in-flight 429:
@@ -65,7 +80,7 @@ import { DynamicBorder, getSelectListTheme, getSettingsListTheme, ExtensionInput
 import { Container, Loader, SelectList, SettingsList, getKeybindings, isKeyRelease, type AutocompleteItem, type TUI } from "@earendil-works/pi-tui";
 import { join } from "node:path";
 import { loadModelsFromCache, fetchModelsFromApi, saveModelsToCache } from "./models.js";
-import { extractRateLimitsFromHeaders, extractRetryAfter, getRateLimitState, setRateLimitState, clearRetryAfter } from "./rate-limits.js";
+import { extractRateLimitsFromHeaders, extractRetryAfter, isQuotaExhausted, getRateLimitState, setRateLimitState, clearRetryAfter } from "./rate-limits.js";
 import { refreshConfig, config, apiKey as cfgApiKey, isRateLimitEmitEnabled, getFooterTimeoutMs, getMaxRateLimitWaitSec, isSharedRateLimitStateEnabled, getSharedStateJitterMs, setSetting, persistSettings, recordProviderRegistration, setModelOverride, removeModelOverride, getOverrideModelIds, getModelOverride, } from "./config.js";
 import { readSharedRateLimitState, publishSharedRateLimitState, getSharedStateDiagnostics } from "./shared-state.js";
 import { debug, trace, setDebugCtx, clearDebugCtx } from "./debug.js";
@@ -144,6 +159,40 @@ function scheduleFooterClear(key: string, ctx: { ui: { setStatus: (k: string, v:
             // ctx may be stale
         }
     }, timeoutMs);
+}
+
+/**
+ * Render the remaining-quota footer from a window snapshot and (re)arm its
+ * auto-clear. Called from `after_provider_response` for successful responses and
+ * from the fetch interceptor's harvest for every other status — otherwise a run
+ * that only produced errors would keep showing the last 2xx's numbers, since
+ * `after_provider_response` never fires for a non-2xx.
+ *
+ * No-op when the snapshot is empty (e.g. a header-less 401) or the footer is off.
+ */
+function renderQuotaFooter(
+    ctx: { ui: { setStatus: (k: string, v: string | undefined) => void; theme: { fg: (style: string, text: string) => string } } },
+    w: import("./rate-limits.js").RateLimitWindows,
+): void {
+    if (config.hideFooter) return;
+    const parts: string[] = [];
+    if (w.minute)
+        parts.push(`m ${w.minute.remaining}/${w.minute.limit}  ⏱${formatWindowReset("minute", w.minute.reset)}`);
+    if (w.hour)
+        parts.push(`h ${w.hour.remaining}/${w.hour.limit}  ⏱${formatWindowReset("hour", w.hour.reset)}`);
+    if (w.day)
+        parts.push(`d ${w.day.remaining}/${w.day.limit}  ⏱${formatWindowReset("day", w.day.reset)}`);
+    if (w.month)
+        parts.push(`M ${w.month.remaining}/${w.month.limit}  ⏱${formatWindowReset("month", w.month.reset)}`);
+    if (parts.length === 0) return;
+    ctx.ui.setStatus("GWDG", ctx.ui.theme.fg("dim", parts.join(" · ")));
+    // Auto-clear after configurable timeout (unless set to never). Cancels any
+    // previously scheduled clear so a rapid sequence of responses always gives
+    // the user a full `footerTimeoutSec` from the most recent one.
+    const footerTimeoutMs = getFooterTimeoutMs();
+    if (Number.isFinite(footerTimeoutMs) && footerTimeoutMs < Infinity) {
+        scheduleFooterClear("GWDG", ctx, footerTimeoutMs);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -523,6 +572,20 @@ function looksLikeRateLimit(errorMessage: string | undefined): boolean {
  *   4. a conservative default.
  */
 const DEFAULT_RATE_LIMIT_WAIT_SEC = 60;
+
+/**
+ * How many times a 5xx that *looks* like a throttle may be waited out before we
+ * stop treating it as one. A 429 is definitive and uncapped; a 5xx is inferred.
+ */
+const MAX_THROTTLED_SERVER_ERROR_RETRIES = 3;
+
+/**
+ * Wait to use when the generic `ratelimit-remaining` alias is the only exhaustion
+ * signal. That alias tracks GWDG's per-second window, so the limit behind it
+ * clears in about a second — `DEFAULT_RATE_LIMIT_WAIT_SEC` is calibrated for the
+ * minute-or-longer windows and would be two orders of magnitude too long here.
+ */
+const THROTTLED_SECOND_WINDOW_WAIT_SEC = 2;
 
 /** Debounce so pi's own quick retries don't spam duplicate notifications. */
 const RATE_LIMIT_NOTIFY_DEBOUNCE_MS = 5000;
@@ -916,15 +979,54 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                 await waitForSharedRateLimit(preflightUrl, init?.signal as AbortSignal | undefined);
             }
             let res = await originalFetch(input as any, init as any);
+            const url = urlOf(input);
+            if (!(providerHost && url.includes(providerHost))) return res;
             try {
-                // Loop so repeated 429s are each handled with a fresh abortable
-                // wait. The wait itself is done HERE (not delegated to the SDK via
-                // Retry-After) so ESC interrupts it immediately — see below.
-                while (res.status === 429) {
-                    const url = urlOf(input);
-                    if (!(providerHost && url.includes(providerHost))) break;
-                    trace("fetch interceptor: 429 from %s", url);
+                // Retries driven by a throttled 5xx are capped. A 429 is a
+                // definitive "you are over quota" and can be waited out as often
+                // as the provider says, but a 5xx is only *inferred* to be a
+                // throttle from the headers; if the endpoint is genuinely broken
+                // while quota happens to read empty, an uncapped loop would retry
+                // a doomed request forever. After the cap we hand the response
+                // back untouched and let the SDK/pi treat it as the server error
+                // it appears to be.
+                //
+                // NOTE the cap is per HTTP attempt, not per user turn: once we
+                // hand the 5xx back, pi's agent-session retry may start a fresh
+                // attempt with a fresh count (see `retry.maxRetries`).
+                let serverErrorRetries = 0;
+                // Loop so repeated rate limits are each handled with a fresh
+                // abortable wait. The wait itself is done HERE (not delegated to
+                // the SDK via Retry-After) so ESC interrupts it immediately.
+                while (true) {
+                    // Harvest the quota snapshot from EVERY status, not just 429:
+                    // all GWDG responses except 401 carry the x-ratelimit-* headers,
+                    // and `after_provider_response` never fires for a non-2xx, so
+                    // this is the only place an error response's snapshot is seen.
                     const windows = extractRateLimitsFromHeaders(res.headers);
+                    if (Object.keys(windows).length > 0) {
+                        setRateLimitState({ windows });
+                        // Keep the footer honest on error-only runs — nothing else
+                        // renders it for a non-2xx.
+                        if (feedbackCtx) renderQuotaFooter(feedbackCtx, windows);
+                    }
+
+                    // A 429 is always a rate limit. A 5xx counts as one only when
+                    // the headers say quota is actually gone: GWDG's gateway
+                    // returns 500 instead of 429 under throttling, but a genuine
+                    // server error must stay a server error.
+                    const throttledServerError = res.status >= 500
+                        && isQuotaExhausted(res.headers, windows);
+                    if (res.status !== 429 && !throttledServerError) break;
+                    if (throttledServerError) {
+                        if (serverErrorRetries >= MAX_THROTTLED_SERVER_ERROR_RETRIES) {
+                            trace("fetch interceptor: status %d still failing after %d throttle retries — surfacing as a server error",
+                                res.status, serverErrorRetries);
+                            break;
+                        }
+                        serverErrorRetries++;
+                    }
+                    trace("fetch interceptor: rate limited (status=%d) from %s", res.status, url);
                     const ra = extractRetryAfter(res.headers);
                     // True provider reset (uncapped) — used both for the
                     // notification and to decide whether to wait. Prefer an
@@ -936,12 +1038,23 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                         for (const w of [windows.minute, windows.hour, windows.day, windows.month]) {
                             if (w && w.remaining <= 0 && w.reset > 0) resets.push(w.reset);
                         }
-                        resetSec = resets.length ? Math.min(...resets) : DEFAULT_RATE_LIMIT_WAIT_SEC;
+                        // No header and no exhausted named window: on a throttled
+                        // 5xx that means the generic (per-second) alias was the only
+                        // exhaustion signal, and that window clears in about a
+                        // second — the minute-scale default would stall us (and,
+                        // via the shared state file, every peer) for no reason.
+                        resetSec = resets.length
+                            ? Math.min(...resets)
+                            : (throttledServerError ? THROTTLED_SECOND_WINDOW_WAIT_SEC : DEFAULT_RATE_LIMIT_WAIT_SEC);
                     }
 
                     // Tell peer sessions before deciding what to do ourselves:
-                    // they should hold off whether we wait or cancel.
-                    if (isSharedRateLimitStateEnabled()) {
+                    // they should hold off whether we wait or cancel. Only for a
+                    // 429 though: a 5xx throttle is inferred, and publishing it
+                    // would make one session's guess stall every peer — while the
+                    // per-second burst limit behind it clears faster than a peer's
+                    // pre-flight read is worth.
+                    if (res.status === 429 && isSharedRateLimitStateEnabled()) {
                         publishSharedRateLimitState({
                             resetTimestamp: Date.now() + resetSec * 1000,
                             windows,
@@ -951,6 +1064,18 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                     const maxWaitSec = getMaxRateLimitWaitSec();
                     // Wait only if the reset is within the configured budget.
                     const willWait = resetSec > 0 && resetSec <= maxWaitSec;
+
+                    // The cancel path reports "quota exceeded" and suppresses every
+                    // retry layer. That is only safe on a 429, which says so
+                    // definitively. A 5xx is *inferred* to be a throttle, so a
+                    // far-off reset must not turn a possibly-genuine outage into a
+                    // hard cancel with a wrong diagnosis: surface it as the server
+                    // error it looks like and leave pi's retry as the backstop.
+                    if (!willWait && res.status !== 429) {
+                        trace("fetch interceptor: status %d looks throttled but reset %ds exceeds max wait %ds — surfacing as a server error",
+                            res.status, resetSec, maxWaitSec);
+                        break;
+                    }
 
                     // Recorded BEFORE the feedback fires: on the cancel path the
                     // errored assistant message (whose text `message_end` rewrites
@@ -966,7 +1091,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                     }
                     else {
                         trace("fetch interceptor: no feedbackCtx yet — cannot render banner/notification");
-                        debug("fetch interceptor: 429 seen but no UI ctx captured yet");
+                        debug("fetch interceptor: rate limit seen but no UI ctx captured yet");
                     }
 
                     if (!willWait) {
@@ -994,7 +1119,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                     // the full wait elapses. Doing it here means ESC aborts now.
                     trace("fetch interceptor: waiting — %ds (max wait %ds), abortable", resetSec, maxWaitSec);
                     debug("fetch interceptor: waiting %ds for reset (abortable)", resetSec);
-                    // Drain the discarded 429 body so the connection is freed.
+                    // Drain the discarded body so the connection is freed.
                     await res.text().catch(() => {});
                     try {
                         await abortableDelay(resetSec * 1000, init?.signal as AbortSignal | undefined);
@@ -1009,7 +1134,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                     // truthful display again) and retry the request ourselves.
                     stopRateLimitBanner();
                     res = await originalFetch(input as any, init as any);
-                    // Loop: a fresh 429 gets a fresh decision + wait.
+                    // Loop: a fresh rate limit gets a fresh decision + wait.
                 }
             }
             catch (err) {
@@ -1121,29 +1246,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
             emitRateLimitEvents(event.status, windows);
         }
         // Update status with remaining quota (all windows)
-        if (!config.hideFooter) {
-            const w = windows;
-            const parts = [];
-            if (w.minute)
-                parts.push(`m ${w.minute.remaining}/${w.minute.limit}  ⏱${formatWindowReset("minute", w.minute.reset)}`);
-            if (w.hour)
-                parts.push(`h ${w.hour.remaining}/${w.hour.limit}  ⏱${formatWindowReset("hour", w.hour.reset)}`);
-            if (w.day)
-                parts.push(`d ${w.day.remaining}/${w.day.limit}  ⏱${formatWindowReset("day", w.day.reset)}`);
-            if (w.month)
-                parts.push(`M ${w.month.remaining}/${w.month.limit}  ⏱${formatWindowReset("month", w.month.reset)}`);
-            const footerTimeoutMs = getFooterTimeoutMs();
-            if (parts.length > 0) {
-                ctx.ui.setStatus("GWDG", ctx.ui.theme.fg("dim", parts.join(" · ")));
-                // Auto-clear after configurable timeout (unless set to never).
-                // Cancels any previously scheduled clear so a rapid sequence of
-                // responses always gives the user a full `footerTimeoutSec` from
-                // the most recent one.
-                if (Number.isFinite(footerTimeoutMs) && footerTimeoutMs < Infinity) {
-                    scheduleFooterClear("GWDG", ctx, footerTimeoutMs);
-                }
-            }
-        }
+        renderQuotaFooter(ctx, windows);
     });
     // 429s never reach `after_provider_response` (the OpenAI SDK throws before
     // the onResponse callback fires). Pi surfaces the failure as an assistant

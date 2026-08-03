@@ -23,7 +23,8 @@ pi-gwdg/
 │   ├── debug.ts                    ← Shared debug logging (TUI-aware, respects config/env) + file tracer
 │   └── ambient.d.ts                ← Ambient type declarations for external modules
 ├── tools/
-│   └── gwdg-sim-proxy.mjs          ← Zero-dep relay proxy for testing 429 handling against real upstream
+│   ├── gwdg-sim-proxy.mjs          ← Zero-dep relay proxy for testing 429 handling against real upstream
+│   └── verify-ratelimit-classification.mjs ← Stub-server checks for 429 / throttled-5xx / genuine-5xx handling
 ├── dist/                           ← Compiled JS output (tsc build target)
 └── node_modules/                   ← Installed dependencies
 ```

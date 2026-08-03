@@ -6,7 +6,7 @@
 
 GWDG enforces per-minute, per-hour, and per-day rate limits communicated via
 `x-ratelimit-*` response headers. The extension tracks remaining quota in the
-status footer, and on a 429 it makes a **bounded** wait-or-cancel decision based
+status footer, and on a rate limit it makes a **bounded** wait-or-cancel decision based
 on when the quota actually resets:
 
 - **Reset within `maxRateLimitWaitSec`** (default 3600s) → wait for the reset,
@@ -22,6 +22,54 @@ The wait/cancel threshold is configurable via `maxRateLimitWaitSec`
 (config file) or `PI_GWDG_MAX_RATE_LIMIT_WAIT_SEC` (env), and editable in
 `/gwdg-settings`. Both surfaces always report the **true** provider reset, even
 when it exceeds the wait budget.
+
+## What Counts as a Rate Limit
+
+GWDG returns the `x-ratelimit-*` headers on **every** status except `401`, so the
+extension harvests the quota snapshot from all of them — including error
+responses. Without this, a run that only produced errors would leave the footer
+and `/gwdg-status` showing stale numbers, because `after_provider_response` never
+fires for a non-2xx response.
+
+Harvesting is not the same as waiting. Two kinds of response enter the
+wait path:
+
+| Response | Treated as a rate limit? |
+|----------|--------------------------|
+| `429` | **Always.** Definitive: waited out as often as the provider says, or cancelled if the reset is beyond the budget. |
+| `5xx` **with quota exhausted in the headers** | **Yes**, but wait-only and at most `3` times per HTTP attempt. GWDG's gateway substitutes a `500` for a `429` under throttling. |
+| `5xx` with quota remaining | No — surfaced as the server error it is. |
+| `4xx` other than `429` (e.g. `404`) | No. Deterministic; retrying cannot help. |
+| `401` | No, and carries no headers at all. |
+
+**Why a 5xx is handled more cautiously than a 429.** A `429` states plainly that
+you are over quota. A `5xx` is only *inferred* to be a throttle, from headers that
+happen to show no quota left — so a genuinely broken endpoint during an exhausted
+window looks identical. Three consequences follow, all of them about keeping a
+wrong inference cheap:
+
+- **The retries are capped.** After 3 waited retries the response is handed back
+  untouched and treated as a normal server error, so a real outage cannot become
+  an unbounded retry loop. The cap counts within one HTTP attempt; pi's
+  agent-session retry (`retry.maxRetries`) may then start a fresh attempt with a
+  fresh count, so the practical bound is 3 × (1 + `retry.maxRetries`).
+- **The cancel path is `429`-only.** Cancelling reports "quota exceeded" and
+  suppresses every retry layer, which is the wrong answer for a server error. So
+  when an inferred-throttle `5xx` has a reset beyond the wait budget, the extension
+  surfaces the `5xx` as-is and leaves pi's retry available, rather than asserting a
+  quota diagnosis it cannot back up.
+- **Nothing is published to peers.** Only a `429` writes the shared state file. A
+  guess should not stall every other session — and the per-second window behind a
+  `5xx` throttle clears faster than a peer's pre-flight read is worth.
+
+**Detection detail.** On a throttled `5xx` the *only* exhaustion signal is the
+generic `ratelimit-remaining: 0` header — the named minute/hour/day/month windows
+all still show quota available. That generic header tracks GWDG's tightest window
+(per-second), so it is read directly as an exhaustion signal, independent of the
+per-window snapshot shown in the footer. The wait follows from the same fact: with
+no `retry-after` and no exhausted *named* window, the fallback is ~2s (the
+per-second window's horizon), not the minute-scale `DEFAULT_RATE_LIMIT_WAIT_SEC`
+that a `429` with no headers at all would get.
 
 ## Rate-Limit Banner
 
@@ -122,20 +170,25 @@ ago it was published. Turn the whole thing off with `sharedRateLimitState: false
 ## Architecture (Summary)
 
 The extension parses rate-limit headers from **successful** responses via
-`after_provider_response`. For **429** responses it wraps `globalThis.fetch`
-(a `fetch` interceptor installed at provider registration), because the
+`after_provider_response`. For every **other** status it relies on a
+`globalThis.fetch` interceptor installed at provider registration, because the
 `openai-completions` API type uses the OpenAI SDK internally and the SDK throws
 on non-2xx responses **before** the `onResponse` callback fires — so
-`after_provider_response` never sees a 429.
+`after_provider_response` never sees an error response.
 
 The interceptor is scoped to the GWDG base URL. **Before** each request it runs
 the shared-state pre-flight check described above, waiting out a limit a peer
-session already hit. On a 429 it:
+session already hit. It records the quota snapshot from every response it sees —
+and renders the footer from it, since nothing else does for a non-2xx (see
+[What Counts as a Rate Limit](#what-counts-as-a-rate-limit)) — and when a
+response qualifies as a rate limit it:
 
 1. Extracts `x-ratelimit-*` / `retry-after` headers and computes the **true**
-   provider reset (uncapped), and publishes it to the shared state file so peer
-   sessions hold off too.
-2. Decides `willWait = reset > 0 && reset <= maxRateLimitWaitSec`.
+   provider reset (uncapped); on a `429` it also publishes that reset to the
+   shared state file so peer sessions hold off too.
+2. Decides `willWait = reset > 0 && reset <= maxRateLimitWaitSec`. A `429` takes
+   either branch; an inferred-throttle `5xx` only ever waits — `!willWait` returns
+   it untouched instead of cancelling.
 3. Takes control of retry timing:
    - **Wait:** pauses for the true reset **inside the interceptor** using an
      abortable delay, then retries the request itself (looping if it gets a
@@ -180,7 +233,7 @@ untouched, so pi's retry remains a backstop there.
 
 | Event | Purpose |
 |-------|---------|
-| `after_provider_response` | Extract rate-limit headers from **successful** responses; update footer; emit event-bus events |
+| `after_provider_response` | Extract rate-limit headers from **successful** responses; update footer; emit event-bus events (error responses are harvested by the fetch interceptor instead, which is the only layer that sees them) |
 | `message_end` / `agent_end` | Observe terminal `stopReason: "error"` (429) as a notification fallback; clear a stale banner; on the cancel path, rewrite the GWDG error message (user-facing report + auto-retry suppression) |
 | `session_start` | Capture UI context early; install custom autocomplete provider for `/gwdg-settings <scope>` argument completion (`project`/`global`) |
 | `session_shutdown` | Cancel footer auto-clear + banner timers; clear GWDG status indicator and banner widget; clear debug context |

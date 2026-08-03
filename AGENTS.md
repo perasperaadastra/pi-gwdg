@@ -26,7 +26,8 @@ pi-gwdg/
 │   ├── debug.ts                    ← Shared debug logging (TUI-aware, respects config/env) + file tracer
 │   └── ambient.d.ts                ← Ambient type declarations for external modules
 ├── tools/
-│   └── gwdg-sim-proxy.mjs          ← Zero-dep relay proxy for testing 429 handling against real upstream
+│   ├── gwdg-sim-proxy.mjs          ← Zero-dep relay proxy for testing 429 handling against real upstream
+│   └── verify-ratelimit-classification.mjs ← Stub-server checks for 429 / throttled-5xx / genuine-5xx handling
 ├── dist/                           ← Compiled JS output (tsc build target)
 └── node_modules/                   ← Installed dependencies
 ```
@@ -37,9 +38,10 @@ Provider registration, event handlers, model mapping, config module, debug
 logging, ambient types, and the command table are documented in
 **[docs/architecture.md](./docs/architecture.md)**.
 
-The 429 fetch interceptor, the rate-limit banner UI, the cancel-report /
+The rate-limit fetch interceptor, the rate-limit banner UI, the cancel-report /
 auto-retry-suppression logic, the cross-session shared-state file format, and
-the testing harnesses (sim proxy, RPC mode, pty driver) are documented in
+the testing harnesses (status-classification checks, sim proxy, RPC mode, pty
+driver) are documented in
 **[docs/rate-limit-internals.md](./docs/rate-limit-internals.md)**.
 
 ## Development
@@ -72,6 +74,27 @@ in `tsconfig.json`: `outDir: "dist"`, `rootDir: "extensions"`).
     retries in-process (so ESC cancels immediately); on the cancel path it sets
     `x-should-retry: false`. `AbortError` is always rethrown from the wrapper's
     `try/catch` so cancellation propagates.
+10a. **Quota harvesting is status-agnostic; the wait decision is not.** The
+    interceptor stores the `x-ratelimit-*` snapshot from every response and
+    renders the footer from it (GWDG sends the headers on all statuses but 401,
+    and `after_provider_response` only ever sees 2xx, so the interceptor is the
+    only layer that can keep an error-only run's footer honest). Entering the
+    wait path is narrower: always for 429, for `>= 500` only when
+    `isQuotaExhausted()` and only up to `MAX_THROTTLED_SERVER_ERROR_RETRIES`
+    times per HTTP attempt. Do not widen this to 4xx (deterministic — a retry
+    cannot help) and do not uncap the 5xx retries: a 5xx throttle is *inferred*,
+    so a real outage during an exhausted window is indistinguishable from
+    throttling and would loop forever.
+10b. **Everything that acts on an *inferred* 5xx throttle stays cheap and local.**
+    Three deliberate asymmetries, all reversible only with new evidence: the
+    cancel path is 429-only (it asserts "quota exceeded" and suppresses every
+    retry layer — too strong a claim for an inference, so a 5xx past the wait
+    budget is returned untouched instead); the shared state file is published on
+    429 only (a guess must not stall peer sessions); and the no-header wait
+    fallback is `THROTTLED_SECOND_WINDOW_WAIT_SEC` (2s) rather than
+    `DEFAULT_RATE_LIMIT_WAIT_SEC` (60s), because the signal that classified it
+    was the generic per-second alias, which clears in about a second.
+    `tools/verify-ratelimit-classification.mjs` locks all of this in.
 11. **pi auto-retry suppression is GWDG-scoped** via the `message_end`
     errorMessage rewrite (which must keep the phrase "quota exceeded"), gated on
     `pendingRateLimitCancel`. It couples to pi-ai's private non-retryable regex

@@ -92,6 +92,27 @@ export function clearRetryAfter(): void {
 
 const WINDOW_PATTERNS = ["minute", "hour", "day", "month"] as const;
 
+type HeaderSource = Headers | Record<string, string | string[] | undefined>;
+
+/** Read a header as a finite number, or undefined. Accepts `Headers` or a plain record. */
+function headerNumber(headers: HeaderSource, name: string): number | undefined {
+  let val: string | string[] | undefined;
+
+  if (typeof (headers as any).get === "function") {
+    val = (headers as Headers).get(name) ?? undefined;
+  } else {
+    val = (headers as Record<string, string | string[] | undefined>)[name];
+  }
+
+  if (val === undefined || val === null) return undefined;
+  const str = Array.isArray(val) ? val[0] : val;
+  // Reject blanks explicitly: Number("") is 0, which would read as a real "no
+  // quota left" and let an empty header masquerade as exhaustion.
+  if (str === undefined || String(str).trim() === "") return undefined;
+  const n = Number(str);
+  return Number.isFinite(n) ? n : undefined;
+}
+
 /**
  * Extract per-window rate limit info from response headers.
  *
@@ -105,30 +126,21 @@ const WINDOW_PATTERNS = ["minute", "hour", "day", "month"] as const;
  *   ratelimit-remaining: 29
  *   ratelimit-reset: 38
  *
- * The `ratelimit-reset` header is a single delta in seconds, representing
- * the reset for the minute window. There are no per-window reset headers.
- * For hour/day/month windows, the reset is calculated as seconds until
- * the next calendar boundary (start of next hour, midnight UTC, 1st of month).
+ * The generic aliases (`ratelimit-limit`/`-remaining`/`-reset`) mirror GWDG's
+ * undocumented **per-second** window (`x-ratelimit-limit-second`, verified by
+ * live probing) — not the minute window, and not any window in
+ * `WINDOW_PATTERNS`. So `ratelimit-reset` is a delta of about a second, which is
+ * why `isQuotaExhausted` reads the generic `-remaining` separately below.
+ *
+ * There are no per-window reset headers. For hour/day/month windows, the reset is
+ * calculated as seconds until the next calendar boundary (start of next hour,
+ * midnight UTC, 1st of month); for the minute window, until the next :00.
  */
 export function extractRateLimitsFromHeaders(headers: Headers | Record<string, string | string[] | undefined>): RateLimitWindows {
   const windows: RateLimitWindows = {};
   dbg("extractRateLimitsFromHeaders: parsing headers");
 
-  // Helper: get a header value as a number (case-insensitive)
-  const getHeader = (name: string): number | undefined => {
-    let val: string | string[] | undefined;
-
-    if (typeof (headers as any).get === "function") {
-      val = (headers as Headers).get(name) ?? undefined;
-    } else {
-      val = (headers as Record<string, string | string[] | undefined>)[name];
-    }
-
-    if (val === undefined || val === null) return undefined;
-    const str = Array.isArray(val) ? val[0] : val;
-    const n = Number(str);
-    return Number.isFinite(n) ? n : undefined;
-  };
+  const getHeader = (name: string) => headerNumber(headers, name);
 
   // Current time for boundary calculations
   const now = Date.now();
@@ -213,20 +225,7 @@ function secondsUntilBoundary(nowMs: number, window: string): number {
  */
 export function extractRetryAfter(headers: Headers | Record<string, string | string[] | undefined>): RateLimitState | null {
   dbg("extractRetryAfter: searching for retry-after or ratelimit-reset headers");
-  const getHeader = (name: string): number | undefined => {
-    let val: string | string[] | undefined;
-
-    if (typeof (headers as any).get === "function") {
-      val = (headers as Headers).get(name) ?? undefined;
-    } else {
-      val = (headers as Record<string, string | string[] | undefined>)[name];
-    }
-
-    if (val === undefined || val === null) return undefined;
-    const str = Array.isArray(val) ? val[0] : val;
-    const n = Number(str);
-    return Number.isFinite(n) ? n : undefined;
-  };
+  const getHeader = (name: string) => headerNumber(headers, name);
 
   // Try retry-after first
   const retryAfterSec = getHeader("retry-after") ?? getHeader("Retry-After");
@@ -250,4 +249,21 @@ export function extractRetryAfter(headers: Headers | Record<string, string | str
 
   dbg("extractRetryAfter: no retry-after or ratelimit-reset header found, returning null");
   return null;
+}
+
+/**
+ * True if the headers say the caller is out of quota *right now*.
+ *
+ * Checks the generic `ratelimit-remaining` alias as well as the parsed windows,
+ * because GWDG's generic alias tracks its tightest (per-second) window, which is
+ * not among `WINDOW_PATTERNS`. On a throttled 5xx that alias is the only
+ * exhaustion signal present — every named window still shows quota left.
+ */
+export function isQuotaExhausted(headers: HeaderSource, windows: RateLimitWindows): boolean {
+  const generic = headerNumber(headers, "ratelimit-remaining");
+  if (generic !== undefined && generic <= 0) return true;
+  return WINDOW_PATTERNS.some((w) => {
+    const win = windows[w];
+    return win !== undefined && win.remaining <= 0;
+  });
 }

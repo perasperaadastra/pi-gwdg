@@ -53,7 +53,11 @@ See [GWDG SAIA documentation](https://docs.hpc.gwdg.de/services/ai-services/saia
 On a 429, the extension either waits for the quota to reset (with a live
 countdown banner) or cancels the request — whichever `maxRateLimitWaitSec`
 dictates — and can share rate-limit state between concurrent pi sessions on the
-same API key so peers don't all discover a limit the hard way.
+same API key so peers don't all discover a limit the hard way. A `5xx` whose
+headers show no quota left is waited out too (GWDG's gateway substitutes a `500`
+for a `429` under throttling), but at most 3 times, since that diagnosis is
+inferred rather than stated. Quota readings in the footer and `/gwdg-status` are
+harvested from *every* response, errors included.
 
 See **[docs/rate-limiting.md](./docs/rate-limiting.md)** for the full behavior
 and configuration, and [docs/rate-limit-internals.md](./docs/rate-limit-internals.md)
