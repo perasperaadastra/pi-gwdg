@@ -23,7 +23,7 @@ pi install git:github.com/perasperaadastra/pi-gwdg
 |---------|-------------|
 | `/gwdg-status` | Show connection status, rate limits, model count |
 | `/gwdg-info <model>` | Show details for a specific model |
-| `/gwdg-models` | List all available models grouped by capability (text / vision / embeddings) |
+| `/gwdg-models` | List all available models grouped by capability (text / vision / embeddings), each with its current `demand` (live load indicator from the API, higher = busier) |
 | `/gwdg-refresh` | Force-refresh model list from API, update cache, re-register provider |
 | `/gwdg-simulate-ratelimit [seconds]` | Simulate a 429 with the given reset (default 30s) to exercise the countdown banner / cancel report and the wait-vs-cancel decision without exhausting real quota. Press `escape` to end the simulated wait early, as the banner offers |
 | `/gwdg-settings [scope]` | Interactive TUI settings editor for hide footer, debug, footer timeout, cache TTL, max rate-limit wait, emit rate limit events, and **model overrides submenu** (add/edit/delete per-model overrides with field-level editor for maxTokens, contextWindow, reasoning, input, thinkingLevelMap). `scope` can be `project` (default, saves to `.pi/gwdg.json`) or `global` (saves to `${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/extensions/gwdg.json`). Autocomplete for `project`/`global` is installed via `session_start`. |

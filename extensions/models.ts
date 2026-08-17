@@ -33,6 +33,8 @@ interface GwdgApiModel {
   description?: string;
   context_window?: number;
   max_tokens?: number;
+  /** Current load indicator reported by the API (higher = busier). Live value, never cached. */
+  demand?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +152,49 @@ export async function fetchModelsFromApi(baseUrl: string, apiKey: string): Promi
   } catch (err) {
     debug("Network error fetching models:", err);
     return [];
+  }
+}
+
+/**
+ * Fetch the live per-model demand from the GWDG API.
+ *
+ * `demand` is the API's current load indicator for a model (higher = busier),
+ * so it is deliberately not persisted with the model cache — a value read from
+ * a 30-day-old cache would be meaningless. Returns null when it cannot be
+ * fetched (no API key, auth error, network failure); callers render without it.
+ */
+export async function fetchModelDemand(baseUrl: string, apiKey: string): Promise<Map<string, number> | null> {
+  if (!apiKey) {
+    debug("No API key available, cannot fetch model demand");
+    return null;
+  }
+
+  const url = `${baseUrl.replace(/\/+$/, "")}/models`;
+
+  try {
+    debug("Fetching model demand from %s", url);
+    const response = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    if (!response.ok) {
+      debug("Demand fetch failed: %d %s", response.status, response.statusText);
+      return null;
+    }
+
+    const body = (await response.json()) as { data?: GwdgApiModel[] };
+    const demand = new Map<string, number>();
+    for (const m of body.data ?? []) {
+      if (typeof m.demand === "number") demand.set(m.id, m.demand);
+    }
+    debug("Fetched demand for %d models", demand.size);
+    return demand.size > 0 ? demand : null;
+  } catch (err) {
+    debug("Network error fetching model demand:", err);
+    return null;
   }
 }
 

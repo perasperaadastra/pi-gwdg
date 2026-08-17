@@ -76,7 +76,7 @@
 import { DynamicBorder, getSelectListTheme, getSettingsListTheme, ExtensionInputComponent, getAgentDir, keyText } from "@earendil-works/pi-coding-agent";
 import { Container, Loader, SelectList, SettingsList, getKeybindings, isKeyRelease, type AutocompleteItem, type TUI } from "@earendil-works/pi-tui";
 import { join } from "node:path";
-import { loadModelsFromCache, fetchModelsFromApi, saveModelsToCache } from "./models.js";
+import { loadModelsFromCache, fetchModelsFromApi, fetchModelDemand, saveModelsToCache } from "./models.js";
 import { extractRateLimitsFromHeaders, extractRetryAfter, getRateLimitState, setRateLimitState, clearRetryAfter } from "./rate-limits.js";
 import { refreshConfig, config, apiKey as cfgApiKey, isRateLimitEmitEnabled, getFooterTimeoutMs, getMaxRateLimitWaitSec, isSharedRateLimitStateEnabled, getSharedStateJitterMs, setSetting, persistSettings, recordProviderRegistration, setModelOverride, removeModelOverride, getOverrideModelIds, getModelOverride, } from "./config.js";
 import { readSharedRateLimitState, publishSharedRateLimitState, getSharedStateDiagnostics } from "./shared-state.js";
@@ -1478,7 +1478,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
         },
     });
     pi.registerCommand("gwdg-models", {
-        description: "List all available GWDG models with their capabilities",
+        description: "List all available GWDG models with their capabilities and current demand",
         handler: async (_args: string | undefined, ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext) => {
             // Get all GWDG models from the registry
             const allModels = ctx.modelRegistry.getAll().filter((m: { provider: string }) => m.provider === PROVIDER_NAME);
@@ -1497,8 +1497,23 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                 groups.push({ label: "Vision", models: visionModels });
             if (embeddingModels.length > 0)
                 groups.push({ label: "Embeddings", models: embeddingModels });
+            // Demand is live load data, so it is fetched fresh instead of read from the
+            // model cache. A failure (no key, offline) just drops the column.
+            const demand = await fetchModelDemand(config.baseUrl, cfgApiKey);
+            // The demand values carry no label of their own — the "demand" column header on
+            // the title line sits directly above them, so both need the same column start.
+            const idWidth = Math.max(...allModels.map((m: { id: string }) => m.id.length));
+            const DEMAND_HEADER = "demand";
+            const demandCol = "   ".length + "├─".length + 1 + idWidth + 2; // connector + branch + space + id + gutter
+            const demandWidth = DEMAND_HEADER.length;
             const lines = [];
-            lines.push(`GWDG Models (${allModels.length} total)`);
+            const title = `GWDG Models (${allModels.length} total)`;
+            if (demand) {
+                lines.push(`${title.padEnd(Math.max(demandCol, title.length + 2))}${DEMAND_HEADER}`);
+            }
+            else {
+                lines.push(`${title} — demand unavailable`);
+            }
             for (let gi = 0; gi < groups.length; gi++) {
                 const g = groups[gi];
                 const isLastGroup = gi === groups.length - 1;
@@ -1508,7 +1523,13 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                     // When this is the last group, no vertical bar is needed (no sibling groups below)
                     const connector = isLastGroup ? "   " : "│  ";
                     const branch = isLastModel ? "└─" : "├─";
-                    lines.push(`${connector}${branch} ${g.models[i].id}`);
+                    const id = g.models[i].id;
+                    if (!demand) {
+                        lines.push(`${connector}${branch} ${id}`);
+                        continue;
+                    }
+                    const d = demand.get(id);
+                    lines.push(`${connector}${branch} ${id.padEnd(idWidth)}  ${String(d ?? "—").padStart(demandWidth)}`);
                 }
             }
             ctx.ui.notify(lines.join("\n"), "info");
