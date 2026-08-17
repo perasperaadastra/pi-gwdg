@@ -74,17 +74,29 @@ in `tsconfig.json`: `outDir: "dist"`, `rootDir: "extensions"`).
     `try/catch` so cancellation propagates.
 11. **pi auto-retry suppression is GWDG-scoped** via the `message_end`
     errorMessage rewrite (which must keep the phrase "quota exceeded"), gated on
-    `pendingRateLimitCancel`. It couples to pi-ai's private non-retryable regex
-    list; verify against the installed pi version if retry behaviour on cancel
-    regresses.
-12. **Shared state is fail-open and advisory.** Every read/write in
+    `pendingRateLimitCancel` — and the provider check runs **before** the flag is
+    consumed, so a foreign errored turn cannot swallow the GWDG turn's rewrite.
+    It couples to pi-ai's private non-retryable regex list; verify against the
+    installed pi version if retry behaviour on cancel regresses.
+12. **Every rate-limit observation point must be provider-scoped.** One extension
+    runtime sees the whole session's traffic, and "429"/"rate limit" text is
+    universal, so an unscoped path reports another provider's quota error as a
+    GWDG one (and lets its headers into our window state). The interceptor scopes
+    by request host; `message_end`/`agent_end` scope by
+    `isGwdgProviderMessage(msg, ctx)`; `after_provider_response` scopes by
+    `ctx.model.provider`, since the event carries no provider. Report text must
+    also match the path that produced it — the cancel report asserts a
+    wait-vs-budget decision that the post-hoc fallback never made
+    (`buildFallbackRateLimitMessage`). See
+    [docs/rate-limit-internals.md](./docs/rate-limit-internals.md#provider-scoping).
+13. **Shared state is fail-open and advisory.** Every read/write in
     `shared-state.ts` swallows its own errors, and the pre-flight check only ever
     delays a request — it never cancels one and never blocks on a reset beyond
     `maxRateLimitWaitSec`. Nothing in the request path may become dependent on
     the file existing, being readable, or being truthful. Never write the API key
     into the payload or the filename (hash it), and never put the file somewhere
     world-writable such as `/dev/shm`.
-13. **Never use `ctx.ui.setWorkingMessage` (or `setWorkingIndicator`) for
+14. **Never use `ctx.ui.setWorkingMessage` (or `setWorkingIndicator`) for
     extension state.** Both are single global slots with no ownership, so
     extensions overwrite each other and "restoring" resets to pi's default rather
     than the previous owner's value. Use keyed surfaces — `setWidget(key, …)`,

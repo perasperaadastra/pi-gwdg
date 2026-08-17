@@ -241,6 +241,13 @@ declare module "@earendil-works/pi-coding-agent" {
     role: "user" | "assistant" | "toolResult" | string;
     stopReason?: string;
     errorMessage?: string;
+    /**
+     * Provider that produced the message (assistant messages only — pi-ai's
+     * `AssistantMessage` declares it non-optional). Optional here because the
+     * same shape covers user/toolResult messages: it is what scopes the
+     * rate-limit fallbacks to GWDG.
+     */
+    provider?: string;
   }
 
   /** Fired for each message lifecycle end (user/assistant/toolResult). */

@@ -78,8 +78,9 @@ pi has **two** retry layers:
 To stop that **without** touching pi's global `retry.*` settings and **only** for
 GWDG, the `message_end` handler consumes `pendingRateLimitCancel` (+
 `pendingRateLimitCancelDetail`) and — when the errored message belongs to the
-`gwdg` provider (`message.provider` or `ctx.model.provider`) — replaces
-`errorMessage` with `buildCancelErrorMessage(detail, original)`. pi applies the
+`gwdg` provider (`isGwdgProviderMessage`: `message.provider`, else
+`ctx.model.provider`) — replaces `errorMessage` with
+`buildCancelErrorMessage(detail, original)`. pi applies the
 returned `{ message }` (`emitMessageEnd` → `_replaceMessageInPlace`) *before* its
 retry classification runs, so `isRetryableAssistantError` returns false and pi
 skips the backoff loop. This mirrors the provider-scoped `message_end`
@@ -87,6 +88,19 @@ errorMessage-rewrite pattern the pi custom-provider docs document for
 context-overflow normalization. The rewrite is idempotent (`/quota exceeded/i`
 guard) and the wait path leaves the message untouched (pi's retry stays available
 as a backstop there).
+
+Two ordering rules make the flag safe to hold across foreign turns:
+
+- **Scope check before consuming it.** Any message can end while a GWDG cancel is
+  pending (a parallel non-GWDG turn, a subagent on another provider). If a foreign
+  `message_end` cleared the flag, the GWDG turn would get neither its report nor
+  the retry suppression — the doomed request would be re-run.
+- **Only rewrite messages that look like a rate limit** (`looksLikeRateLimit`, or
+  an empty `errorMessage`). Because the flag now survives foreign turns it can
+  also go stale — a cancelled request that ends as `aborted` returns before the
+  consume — and only a message pi would classify as a *retryable* rate-limit
+  error needs the rewrite at all, so an unrelated GWDG error is left alone
+  instead of being relabelled as a quota cancel.
 
 `buildCancelErrorMessage` does double duty: it is the **user-facing report** for
 the cancel path (a countdown needs a repaintable surface; a finished turn is not
@@ -101,10 +115,10 @@ Provider response: 429: {…}
 ```
 
 Because that message exists, `triggerRateLimitFeedback` emits **no** notification
-when `pendingRateLimitCancel` is set — it would only duplicate it. Cancel paths
-with no errored message (the `message_end`/`agent_end` fallback,
-`/gwdg-simulate-ratelimit`) still notify, reusing the same builder so there is one
-wording for "cancelled because of quota".
+when `pendingRateLimitCancel` is set — it would only duplicate it. Paths with no
+errored message of their own still notify: `/gwdg-simulate-ratelimit` reuses the
+same builder (it is demonstrating that exact decision), while the
+`message_end`/`agent_end` fallback uses `buildFallbackRateLimitMessage`.
 
 > **Coupling note:** the non-retryable classification depends on pi-ai's private
 > regex list in `utils/retry.ts`, where the matched phrase is **"quota exceeded"**
@@ -113,8 +127,56 @@ wording for "cancelled because of quota".
 > regression is the old behaviour returning (a few seconds of backoff before the
 > cancel), not a crash.
 
+## Fallback path (`handleRateLimitError`)
+
+`message_end`/`agent_end` catch a 429 that surfaced as a terminal errored
+assistant message — retries exhausted, or a 429 that never passed through our
+`fetch` wrapper. Two things it must get right, both of which it originally got
+wrong:
+
+- **Provider scope.** Detection is text-based (`looksLikeRateLimit` matches
+  `429` / `too many requests` / `rate limit`) and *every* provider phrases rate
+  limits that way, so an unscoped handler reports another provider's 429 as a GWDG
+  quota problem. Concretely, pi's own Console provider failing with
+  `429: {"type":"FreeUsageLimitError",…}` produced a GWDG banner-and-budget
+  warning pointing at `maxRateLimitWaitSec`, which has nothing to do with it.
+  `isGwdgProviderMessage(msg, ctx)` gates the whole handler; an unknown provider
+  counts as **not** ours, since a missed GWDG fallback notification is invisible
+  (the interceptor already reported the episode) while a false one is not.
+- **Wording.** Nothing decided to skip a wait here — the request had already
+  failed when we saw it — so the text must not reuse the cancel report's claim
+  that the reset was beyond the budget and that we cancelled because of it (with
+  the default estimate that read as the self-contradicting "resets in 60s …
+  beyond the ~60 min max wait"). `buildFallbackRateLimitMessage` says the request
+  failed before the wait-and-retry path could handle it, marks the reset as an
+  estimate (headers are gone on the error path — `estimateResetSeconds` falls back
+  to the error body, then the last-known windows, then
+  `DEFAULT_RATE_LIMIT_WAIT_SEC`), and only mentions the budget when the estimate
+  actually exceeds it.
+
+It keeps the shared `CANCEL_REPORT_MARKER` opening phrase, which is also how the
+handler recognises our own rewritten message when `agent_end` re-delivers it.
+
+## Provider scoping
+
+pi runs one extension runtime for the whole session, so **every** handler sees
+traffic from whatever provider the user is on. Nothing about a rate-limit error is
+GWDG-specific by itself, so each observation point needs its own scope:
+
+| Point | Scoped by | Why it matters |
+|-------|-----------|----------------|
+| fetch interceptor | request host contains the configured `baseUrl` host | Non-GWDG traffic through `globalThis.fetch` is passed straight through (also why the pre-flight is host-matched first — it costs nothing for foreign requests). |
+| `message_end` / `agent_end` fallback | `isGwdgProviderMessage` (`message.provider`, else `ctx.model.provider`) | Otherwise any provider's 429 text is reported as a GWDG quota problem. |
+| `message_end` cancel rewrite | same, checked **before** consuming `pendingRateLimitCancel` | Otherwise a foreign errored turn swallows the flag and the GWDG turn loses both its report and the retry suppression. |
+| `after_provider_response` | `ctx.model.provider` (fail-open when the model is unknown) | The event carries only `status` + `headers` — pi's `onResponse` has the model but does not forward it — so the active model is the only signal. Unscoped, another provider's `x-ratelimit-*` headers land in our per-window singleton (skewing `/gwdg-status` and the fallback estimate), and its 2xx responses clear an active GWDG wait *and* publish a recovery that stops peer sessions from holding off. |
+
+`ctx.model` is a live getter for the session's current model
+(`runner.js`: `get model() { return getModel() }`), so it tracks `/model` switches
+without extra bookkeeping.
+
 The extension's role:
 - Parse rate-limit headers from **successful** responses (`after_provider_response`) and **429** responses (fetch interceptor) into the same module-level singleton.
+- Keep every one of those paths scoped to GWDG: the interceptor by request host, the event handlers by provider (see [Provider scoping](#provider-scoping) below).
 - Make the bounded wait-vs-cancel decision and align the SDK's retry timing to the true reset.
 - Render the wait countdown in its own keyed widget (no cross-extension UI collisions).
 - Report + suppress pi's auto-retry on cancel (GWDG-scoped, via `message_end`).
@@ -143,7 +205,7 @@ transport stays swappable (socket, daemon) without touching consumers.
 | Payload | `{ v: 1, resetTimestamp, windows, writtenAt, pid }`. `resetTimestamp: 0` means "recovered". |
 | Atomicity | Write to `<path>.<pid>.<n>.tmp` in the same directory, then `renameSync`. A concurrent reader sees the whole old file or the whole new one. |
 | Validation | Rejects wrong `v`, non-finite numbers, `writtenAt` more than 60s in our future (clock skew), and resets more than 24h out. Bad `windows` degrades to `{}`. |
-| Write points | 429 in the interceptor (before the wait/cancel decision); `after_provider_response` with `status < 400` (publishes recovery + fresh windows, throttled to 2s for routine snapshot refreshes — anything that changes whether peers should hold off bypasses the throttle). |
+| Write points | 429 in the interceptor (before the wait/cancel decision); `after_provider_response` with `status < 400` **on a GWDG response** (publishes recovery + fresh windows, throttled to 2s for routine snapshot refreshes — anything that changes whether peers should hold off bypasses the throttle). |
 | Read point | `waitForSharedRateLimit`, host-matched, before every `originalFetch`. |
 | Fail-open | Every export swallows its own errors. Unreadable, corrupt, or uncreatable state degrades to the per-process behaviour. A failed `mkdir` is not retried for 60s. |
 
@@ -200,6 +262,28 @@ working; and `/gwdg-status` should show the resolved path and the peer's reset.
 For a scripted version, spawning two node processes that load
 `extensions/index.ts` against a stub HTTP server exercises the whole path —
 pre-flight wait, 429 publish, process boundary — without real quota.
+
+**Provider scoping** needs no pi at all: `await (await import("../dist/index.js"))
+.default(fakePi)` with a `fakePi` that just collects `on`/`registerCommand`
+handlers, then emit the events by hand against a stub `ctx` whose
+`ui.notify`/`ui.setStatus` push into arrays. Three checks, each of which failed
+before the scoping fixes:
+
+- `message_end` / `agent_end` with an errored message whose `provider` is *not*
+  `gwdg` (e.g. `errorMessage: '429: {"type":"FreeUsageLimitError",…}'`) must emit
+  **no** notification; the same message with `provider: "gwdg"` must emit exactly
+  one, worded as the fallback (not as a budget-exceeded cancel).
+- `after_provider_response` with `status: 200` + `x-ratelimit-*-minute` headers and
+  a foreign `ctx.model.provider` must leave `setStatus` untouched and
+  `/gwdg-status` reporting "no rate limit data yet"; the same event with
+  `provider: "gwdg"` must render the footer line.
+- The cancel path end to end: point `baseUrl` at a stub server returning 429 with
+  `retry-after: 7200` (beyond the max wait), `await fetch(baseUrl + "/chat/completions")`
+  — asserting `x-should-retry: false` and no `retry-after` on what comes back —
+  then emit a **foreign** errored `message_end` (must return no rewrite and leave
+  the flag alone) followed by a `gwdg` one (must return `{ message }` whose
+  `errorMessage` carries the cancel report). Set `PI_CODING_AGENT_DIR` to a temp
+  dir and write `extensions/gwdg.json` there to point at the stub.
 
 Notes when driving a real 429 through the proxy: the models cache is keyed by
 `baseUrl`, so a proxy `baseUrl` misses the cache — either pre-seed a cache file

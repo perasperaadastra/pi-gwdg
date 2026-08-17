@@ -162,8 +162,26 @@ $PI_GWDG_MAX_RATE_LIMIT_WAIT_SEC); /gwdg-status shows the current quota.
 ```
 
 No notification is emitted for that path, since it would duplicate the message.
-Paths that produce no errored message — the `message_end`/`agent_end` fallback and
-`/gwdg-simulate-ratelimit` — still notify, with the same wording.
+Paths with no errored message of their own still notify: `/gwdg-simulate-ratelimit`
+with the same wording (it demonstrates that exact decision), and the
+`message_end`/`agent_end` fallback — a 429 that surfaced as a finished, errored
+turn instead of being caught in flight — with its own, since nothing chose to skip
+a wait there:
+
+```
+GWDG rate limited — quota exceeded. The request failed with a rate-limit error
+before the wait-and-retry path could handle it. Quota resets in 60s (around 13:39)
+— estimated, since the error path carries no headers.
+/gwdg-status shows the current quota.
+```
+
+**All of this is scoped to the GWDG provider.** The interceptor matches on the
+GWDG host, and the event-level fallbacks check the errored message's provider
+(falling back to the active model's). This matters because rate-limit *text* looks
+the same everywhere: without the check, another provider's 429 — pi's own
+`FreeUsageLimitError`, say — would be reported as a GWDG quota problem and point
+you at `maxRateLimitWaitSec`, which has nothing to do with it. The same scoping
+keeps another provider's `x-ratelimit-*` headers out of `/gwdg-status`.
 
 **Suppressing pi's auto-retry on cancel (GWDG only).** pi has a second retry
 layer above the SDK — its agent-session auto-retry (`retry.maxRetries`, default
@@ -180,7 +198,7 @@ untouched, so pi's retry remains a backstop there.
 
 | Event | Purpose |
 |-------|---------|
-| `after_provider_response` | Extract rate-limit headers from **successful** responses; update footer; emit event-bus events |
-| `message_end` / `agent_end` | Observe terminal `stopReason: "error"` (429) as a notification fallback; clear a stale banner; on the cancel path, rewrite the GWDG error message (user-facing report + auto-retry suppression) |
+| `after_provider_response` | Extract rate-limit headers from **successful** GWDG responses; update footer; emit event-bus events |
+| `message_end` / `agent_end` | Observe a terminal GWDG `stopReason: "error"` (429) as a notification fallback; clear a stale banner; on the cancel path, rewrite the GWDG error message (user-facing report + auto-retry suppression) |
 | `session_start` | Capture UI context early; install custom autocomplete provider for `/gwdg-settings <scope>` argument completion (`project`/`global`) |
 | `session_shutdown` | Cancel footer auto-clear + banner timers; clear GWDG status indicator and banner widget; clear debug context |

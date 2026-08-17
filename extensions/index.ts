@@ -60,6 +60,18 @@
  *
  * The `message_end` / `agent_end` handlers remain as a best-effort fallback
  * for terminal errors that surface as an assistant `stopReason: "error"`.
+ *
+ * Provider scoping
+ * ----------------
+ * One extension runtime serves the whole session, so every handler here sees
+ * traffic from whatever provider is active. Nothing about a rate-limit error is
+ * GWDG-specific on its own — "429" / "rate limit" is how every provider phrases
+ * it — so each observation point carries its own scope: the interceptor matches
+ * the request host, the `message_end` / `agent_end` fallbacks check the errored
+ * message's provider (`isGwdgProviderMessage`), and `after_provider_response`
+ * checks the active model, since that event carries no provider. Without those
+ * checks another provider's quota error is reported as a GWDG one, and its
+ * `x-ratelimit-*` headers land in our per-window state.
  */
 import { DynamicBorder, getSelectListTheme, getSettingsListTheme, ExtensionInputComponent, getAgentDir, keyText } from "@earendil-works/pi-coding-agent";
 import { Container, Loader, SelectList, SettingsList, getKeybindings, isKeyRelease, type AutocompleteItem, type TUI } from "@earendil-works/pi-tui";
@@ -502,10 +514,36 @@ function clearRateLimitWait(): void {
 }
 
 /**
+ * Whether an errored assistant message came from the GWDG provider.
+ *
+ * Every rate-limit path that keys off error TEXT needs this: "429" / "rate
+ * limit" wording is universal, so an unscoped match reports another provider's
+ * quota error (e.g. pi's own `FreeUsageLimitError` from the Console provider) as
+ * a GWDG one — complete with GWDG-specific advice about `maxRateLimitWaitSec`.
+ * The fetch interceptor is scoped by host instead; only the event-level
+ * fallbacks need this check.
+ *
+ * `AssistantMessage.provider` names the provider that produced the message and
+ * is always present in practice; the active model is only a fallback for hosts
+ * that omit it. Unknown means "not ours" — a missed GWDG fallback notification
+ * is invisible (the interceptor already reported it), a false one is not.
+ */
+function isGwdgProviderMessage(
+    msg: { provider?: string } | undefined,
+    ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext,
+): boolean {
+    const provider = msg?.provider ?? (ctx.model as { provider?: string } | undefined)?.provider;
+    return provider === PROVIDER_NAME;
+}
+
+/**
  * Detect whether an error message describes an HTTP 429 / rate-limit error.
  * The `openai-completions` provider surfaces errors as a formatted string
  * (see pi-ai `error-body.ts`) shaped like `"429: {\"error\":...}"`, so we
  * match on the status code and common rate-limit phrasings.
+ *
+ * Text-only: it says nothing about WHICH provider produced the error, so every
+ * caller must pair it with `isGwdgProviderMessage`.
  */
 function looksLikeRateLimit(errorMessage: string | undefined): boolean {
     if (!errorMessage) return false;
@@ -563,8 +601,9 @@ function formatClockTime(timestamp: number): string {
 }
 
 /**
- * Opening phrase of every cancel report we write. Doubles as the marker that
- * lets `handleRateLimitError` recognise our own text and not treat it as a fresh
+ * Opening phrase of every rate-limit report we write (cancel report and
+ * fallback notification alike). Doubles as the marker that lets
+ * `handleRateLimitError` recognise our own text and not treat it as a fresh
  * rate-limit error (`agent_end` sees the rewritten message and would otherwise
  * emit a notification duplicating it).
  *
@@ -603,6 +642,31 @@ function buildCancelErrorMessage(
     if (original) {
         lines.push(`Provider response: ${original}`);
     }
+    return lines.join("\n");
+}
+
+/**
+ * Report for the fallback path: a GWDG rate-limit error that reached us as a
+ * finished, errored assistant turn (see `handleRateLimitError`). Nothing decided
+ * to skip a wait here — the request had already failed by the time we saw it —
+ * so this must NOT reuse `buildCancelErrorMessage`, whose text asserts that the
+ * reset was beyond the budget and that we cancelled because of it. The reset is
+ * an estimate too: headers are unavailable on the error path.
+ */
+function buildFallbackRateLimitMessage(resetSec: number, maxWaitSec: number): string {
+    const resetAt = formatClockTime(Date.now() + resetSec * 1000);
+    const lines = [
+        `${CANCEL_REPORT_MARKER}. The request failed with a rate-limit error before the`
+        + ` wait-and-retry path could handle it. Quota resets in ${formatWait(resetSec)}`
+        + ` (around ${resetAt}) — estimated, since the error path carries no headers.`,
+    ];
+    if (resetSec > maxWaitSec) {
+        lines.push(
+            `That is beyond the ${maxWaitSec === 0 ? "disabled" : formatWait(maxWaitSec)} max wait, so waiting it out`
+            + " needs a bigger budget: /gwdg-settings → maxRateLimitWaitSec (or $PI_GWDG_MAX_RATE_LIMIT_WAIT_SEC).",
+        );
+    }
+    lines.push("/gwdg-status shows the current quota.");
     return lines.join("\n");
 }
 
@@ -711,11 +775,14 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
      * @param opts.windows  per-window snapshot to store for `/gwdg-status`
      * @param opts.simulated  no request behind this wait (`/gwdg-simulate-ratelimit`),
      *   so the banner's cancel hint needs the interrupt key wired up explicitly
+     * @param opts.fallback  the request had already failed when we saw the error
+     *   (`handleRateLimitError`), so no wait was skipped on purpose — the report
+     *   must not claim the reset exceeded the budget
      */
     function triggerRateLimitFeedback(
         ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext,
         resetSec: number,
-        opts: { willWait: boolean; maxWaitSec: number; windows?: import("./rate-limits.js").RateLimitWindows; simulated?: boolean },
+        opts: { willWait: boolean; maxWaitSec: number; windows?: import("./rate-limits.js").RateLimitWindows; simulated?: boolean; fallback?: boolean },
     ): void {
         if (opts.windows) setRateLimitState({ windows: opts.windows });
         debug("rate limit: reset=%ds willWait=%s", resetSec, opts.willWait);
@@ -753,9 +820,13 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
             if (!pendingRateLimitCancel) {
                 const now = Date.now();
                 if (now - lastRateLimitNotifyAt >= RATE_LIMIT_NOTIFY_DEBOUNCE_MS) {
-                    // Same text the cancelled turn's error message carries, so
-                    // there is one wording for "cancelled because of quota".
-                    ctx.ui.notify(buildCancelErrorMessage({ resetSec, maxWaitSec: opts.maxWaitSec }, ""), "warning");
+                    // Cancel decision → same text the cancelled turn's error
+                    // message carries, so there is one wording for "cancelled
+                    // because of quota". Fallback → an already-failed request,
+                    // which that wording would misdescribe.
+                    ctx.ui.notify(opts.fallback
+                        ? buildFallbackRateLimitMessage(resetSec, opts.maxWaitSec)
+                        : buildCancelErrorMessage({ resetSec, maxWaitSec: opts.maxWaitSec }, ""), "warning");
                     lastRateLimitNotifyAt = now;
                 }
             }
@@ -770,13 +841,28 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
      * fetch wrapper handles in-flight 429s; this only catches 429s that reach
      * the extension as an errored assistant message (e.g. retries exhausted).
      * By the time this fires the request has already failed, so willWait=false.
+     *
+     * Scoped to the GWDG provider: the detection is text-based, and every
+     * provider phrases rate limits the same way, so without the scope check any
+     * other provider's 429 (pi's Console `FreeUsageLimitError`, say) would be
+     * reported as a GWDG quota problem, pointing the user at GWDG settings that
+     * have nothing to do with it.
      */
-    function handleRateLimitError(errorMessage: string | undefined, ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext): void {
-        // Our own cancel report, seen again (message_end rewrites the message, then
+    function handleRateLimitError(
+        msg: { provider?: string; errorMessage?: string } | undefined,
+        ctx: import("@earendil-works/pi-coding-agent").ExtensionCommandContext,
+    ): void {
+        const errorMessage = msg?.errorMessage;
+        // Our own report, seen again (message_end rewrites the message, then
         // agent_end delivers the rewritten one). Re-handling it would notify about
         // a cancel the message already explains.
         if (errorMessage?.includes(CANCEL_REPORT_MARKER)) {
-            trace("handleRateLimitError: already our cancel report — skipping");
+            trace("handleRateLimitError: already our own report — skipping");
+            return;
+        }
+        if (!isGwdgProviderMessage(msg, ctx)) {
+            trace("handleRateLimitError: provider=%s is not %s — skipping",
+                msg?.provider ?? "(unknown)", PROVIDER_NAME);
             return;
         }
         const matched = looksLikeRateLimit(errorMessage);
@@ -787,6 +873,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
         triggerRateLimitFeedback(ctx, estimateResetSeconds(errorMessage), {
             willWait: false,
             maxWaitSec: getMaxRateLimitWaitSec(),
+            fallback: true,
         });
     }
 
@@ -1095,7 +1182,20 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
         feedbackCtx = ctx;
         setDebugCtx(ctx);
         trace("after_provider_response: status=%s hasHeaders=%s", event.status, "headers" in event);
-        // Only handle GWDG responses
+        // Only handle GWDG responses. The event carries no provider (pi drops the
+        // model when it emits this), so the active model is the only signal: a
+        // response arriving now belongs to the model the session is streaming
+        // with. Without this, another provider's `x-ratelimit-*` headers land in
+        // our per-window state (skewing `/gwdg-status` and the fallback reset
+        // estimate), and its successful responses clear an active GWDG wait —
+        // including the shared-state entry peer sessions are holding off on.
+        // Fail-open when the model is unknown: behave as before rather than go
+        // silent.
+        const responseProvider = (ctx.model as { provider?: string } | undefined)?.provider;
+        if (responseProvider !== undefined && responseProvider !== PROVIDER_NAME) {
+            trace("after_provider_response: provider=%s is not %s — ignoring", responseProvider, PROVIDER_NAME);
+            return;
+        }
         if (event.status === undefined)
             return;
         if (!("headers" in event))
@@ -1195,19 +1295,25 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
         // row, which disappears on its own), so clear it defensively here.
         if (msg?.role === "assistant") stopRateLimitBanner();
         if (!msg || msg.role !== "assistant" || msg.stopReason !== "error") return;
-        handleRateLimitError(msg.errorMessage, ctx);
+        handleRateLimitError(msg, ctx);
 
         // Cancel path only: rewrite the errorMessage so pi does not auto-retry.
-        // Scope strictly to GWDG (message provider or the active model's
-        // provider) so other providers' rate-limit errors keep pi's retry.
+        // Scope strictly to GWDG (message provider, or the active model's when the
+        // message carries none) so other providers' rate-limit errors keep pi's
+        // retry. The provider check comes BEFORE consuming the flag: a foreign
+        // errored turn finishing between our cancel and its own message_end must
+        // not swallow the rewrite the GWDG turn is waiting for.
         if (!pendingRateLimitCancel) return;
+        if (!isGwdgProviderMessage(msg, ctx)) return;
+        const original = msg.errorMessage ?? "";
+        // The flag can go stale — a cancelled request that ends as "aborted"
+        // returns above without consuming it. Only a message pi would classify as
+        // a retryable rate-limit error needs the rewrite, so an unrelated GWDG
+        // error is left alone instead of being relabelled as a quota cancel.
+        if (original && !looksLikeRateLimit(original)) return;
         pendingRateLimitCancel = false;
         const detail = pendingRateLimitCancelDetail;
         pendingRateLimitCancelDetail = null;
-        const msgProvider = (msg as { provider?: string }).provider;
-        const modelProvider = (ctx.model as { provider?: string } | undefined)?.provider;
-        if (msgProvider !== PROVIDER_NAME && modelProvider !== PROVIDER_NAME) return;
-        const original = msg.errorMessage ?? "";
         if (/quota exceeded/i.test(original)) return; // idempotent
         const rewritten = buildCancelErrorMessage(detail, original);
         trace("message_end: rewrote errorMessage to report the cancel + suppress pi auto-retry (gwdg)");
@@ -1234,7 +1340,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
         for (let i = messages.length - 1; i >= 0; i--) {
             const m = messages[i];
             if (m && m.role === "assistant" && m.stopReason === "error") {
-                handleRateLimitError(m.errorMessage, ctx);
+                handleRateLimitError(m, ctx);
                 break;
             }
         }
