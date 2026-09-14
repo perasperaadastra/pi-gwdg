@@ -69,7 +69,11 @@ declare module "@earendil-works/pi-tui" {
 
   export interface AutocompleteProvider {
     getSuggestions(lines: string[], cursorLine: number, cursorCol: number, options?: unknown): Promise<{ items: AutocompleteItem[]; prefix: string }>;
-    applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: AutocompleteItem, prefix: string): string[];
+    // pi assigns the result straight into editor state as
+    // `state.lines = result.lines; state.cursorLine = result.cursorLine;
+    // setCursorCol(result.cursorCol)`. Returning a bare string[] leaves all
+    // three undefined and crashes the editor on the next keystroke.
+    applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: AutocompleteItem, prefix: string): { lines: string[]; cursorLine: number; cursorCol: number };
     shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
   }
 

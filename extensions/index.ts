@@ -2429,7 +2429,7 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                             const argPrefix = textBeforeCursor.slice(spaceIndex + 1);
                             const filtered = gwdgSettingsScopeItems().filter((i) => i.value.startsWith(argPrefix));
                             if (filtered.length > 0) {
-                                return { items: filtered, prefix: argPrefix };
+                                return { items: own(filtered), prefix: argPrefix };
                             }
                         }
                     }
@@ -2451,12 +2451,16 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
                     textBeforeCursor.startsWith("/") &&
                     textBeforeCursor.indexOf(" ") !== -1 &&
                     textBeforeCursor.slice(1, textBeforeCursor.indexOf(" ")) === "gwdg-settings";
-                if (!stillInArgContext && gwdgSettingsScopeItems().some((i) => i.value === item.value)) {
+                if (!stillInArgContext && isOwn(item)) {
                     // Stale argument completion — prefix is from a previous
                     // argument-completion context but the cursor is no longer in
                     // a /gwdg-settings <arg> position. Return text unchanged so
                     // the editor handles Tab via normal handleTabCompletion flow.
-                    return [...lines];
+                    //
+                    // Ownership is checked by tag, not by value: "project" and
+                    // "global" are also /see-settings and /advisor arguments,
+                    // and intercepting those swallowed their completions.
+                    return { lines: [...lines], cursorLine, cursorCol };
                 }
                 return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
             },
@@ -2485,6 +2489,22 @@ export default async function (pi: import("@earendil-works/pi-coding-agent").Ext
     });
 
     // --- Shared helpers ---
+
+    // Suggestions we hand to pi are tagged, so applyCompletion can recognise
+    // them by provenance rather than by value.  Values are not namespaced:
+    // "project"/"global" are also /see-settings and /advisor arguments, and
+    // matching on `item.value` alone makes us intercept foreign completions.
+    interface OwnedItem extends AutocompleteItem {
+        __gwdgOwned?: true;
+    }
+
+    function own(items: AutocompleteItem[]): OwnedItem[] {
+        return items.map((i) => ({ ...i, __gwdgOwned: true }));
+    }
+
+    function isOwn(item: AutocompleteItem): boolean {
+        return (item as OwnedItem).__gwdgOwned === true;
+    }
 
     /** Build the argument-completion items for /gwdg-settings scope. */
     function gwdgSettingsScopeItems(): AutocompleteItem[] {
